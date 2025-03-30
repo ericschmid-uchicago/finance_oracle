@@ -2360,11 +2360,10 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
         if hasattr(market_tensor, 'numpy'):
             tensor_data = market_tensor.cpu().numpy()[0]
             # Assuming price changes are somewhere in the feature set
-            # This is a simplification - adjust indices based on your actual feature order
             recent_returns = tensor_data[:, 13]  # Adjust index to match Price_Change index
             recent_volatility = np.std(recent_returns) if len(recent_returns) > 0 else 0
             
-            # Determine trend (very simplified)
+            # Determine trend 
             if np.mean(recent_returns) > 0:
                 market_trend = "bullish"
             else:
