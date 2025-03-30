@@ -715,6 +715,33 @@ class MarketFeatureExtractor:
             if extreme_mask.any():
                 print(f"Replacing extreme values in column: {col}")
                 all_features.loc[extreme_mask, col] = all_features[col].median()
+
+        # Clean up any infinity or extremely large values before scaling
+        all_features = all_features.replace([np.inf, -np.inf], np.nan)
+        
+        # Print columns with NaN values to debug
+        nan_columns = all_features.columns[all_features.isna().any()].tolist()
+        if nan_columns:
+            print(f"Columns with NaN values: {nan_columns}")
+        
+        # Fill NaN values
+        all_features = all_features.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        # Replace extremely large values with column medians
+        for col in all_features.columns:
+            # Calculate column median for non-extreme values
+            median_val = all_features[col][np.abs(all_features[col]) < 1e10].median()
+            if pd.isna(median_val):
+                median_val = 0
+                
+            # Replace extreme values
+            extreme_mask = np.abs(all_features[col]) > 1e10
+            extreme_count = extreme_mask.sum()
+            if extreme_count > 0:
+                print(f"Replacing {extreme_count} extreme values in column: {col}")
+                all_features.loc[extreme_mask, col] = median_val
+        
+        print("Data preprocessing complete, proceeding with scaling...")
         
         # Now scale the cleaned data
         scaled = self.scaler.fit_transform(all_features)
