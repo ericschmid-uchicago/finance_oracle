@@ -2329,7 +2329,7 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
 
     print(f"Prediction for next day: {label_map[prediction]}")
     print(f"Confidence: DOWN={confidence[0]:.2f}, NEUTRAL={confidence[1]:.2f}, UP={confidence[2]:.2f}")
-    print(f"Model uncertainty: {uncertainty:.2f} (lower is better)")
+    print(f"Model uncertainty: {float(uncertainty):.2f} (lower is better)")
 
     return prediction, confidence, uncertainty, latest_dates
 
