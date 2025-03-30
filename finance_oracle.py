@@ -480,7 +480,7 @@ class MarketFeatureExtractor:
     def get_macroeconomic_data(self, start_date, end_date):
         """
         Get macroeconomic data using FRED API
-
+    
         Key indicators:
         - CPIAUCSL: Consumer Price Index (Inflation)
         - UNRATE: Unemployment Rate
@@ -515,17 +515,17 @@ class MarketFeatureExtractor:
             'MORTGAGE30US', # 30-Year Fixed Rate Mortgage Average
             'JTSJOL'     # Job Openings
         ]
-
+    
         # Convert date strings to datetime objects
         start_dt = datetime.strptime(start_date, '%Y-%m-%d')
         end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-
+    
         # Add extra buffer at the start to handle potential NA values
         # FRED data can be monthly or quarterly, so we need more history
         start_dt_buffer = start_dt - timedelta(days=365)
-
+    
         print("Fetching FRED macroeconomic data...")
-
+    
         # Fetch data for each series
         all_macro_data = {}
         for series_id in fred_series:
@@ -535,7 +535,7 @@ class MarketFeatureExtractor:
                     observation_start=start_dt_buffer.strftime('%Y-%m-%d'),
                     observation_end=end_dt.strftime('%Y-%m-%d')
                 )
-
+    
                 if not series_data.empty:
                     # Store the series in our dictionary
                     all_macro_data[series_id] = series_data
@@ -544,30 +544,30 @@ class MarketFeatureExtractor:
                     print(f"  - No data found for {series_id}")
             except Exception as e:
                 print(f"  - Error fetching {series_id}: {e}")
-
+    
         # Create a DataFrame with all series
         if all_macro_data:
             # Combine all series into a single DataFrame
             macro_df = pd.DataFrame(all_macro_data)
-
+    
             # We need to resample to daily frequency since FRED data has mixed frequencies
             # First, forward fill missing dates
             idx = pd.date_range(start=start_dt, end=end_dt)
             macro_df = macro_df.reindex(idx, method='ffill')
-
+    
             # For any remaining NaNs, use backward fill
             macro_df = macro_df.fillna(method='bfill')
-
+    
             # Calculate additional derived features
             for col in macro_df.columns:
                 # Skip columns with too many NaNs
                 if macro_df[col].isna().sum() > len(macro_df) * 0.3:
                     continue
-            
+    
                 # Percent changes for different time windows
                 macro_df[f'{col}_1m_change'] = macro_df[col].pct_change(periods=20)  # ~1 month
                 macro_df[f'{col}_3m_change'] = macro_df[col].pct_change(periods=60)  # ~3 months
-            
+    
                 # Calculate trends (slope)
                 macro_df[f'{col}_trend'] = macro_df[col].rolling(window=30).apply(
                     lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) > 5 else np.nan
@@ -583,7 +583,7 @@ class MarketFeatureExtractor:
                 
                 # Rate of change acceleration
                 macro_df[f'{col}_acceleration'] = macro_df[f'{col}_1m_change'].diff(periods=20)
-
+    
             # Economic health composite
             if all(col in macro_df.columns for col in ['UNRATE', 'CPIAUCSL', 'INDPRO']):
                 # Make sure the z-scores are calculated first
@@ -592,14 +592,14 @@ class MarketFeatureExtractor:
                     if col_zscore not in macro_df.columns:
                         # Calculate it if not already present
                         macro_df[col_zscore] = (macro_df[col] - macro_df[col].rolling(252).mean()) / macro_df[col].rolling(252).std()
-            
-    # Now create the economic health composite            
-    macro_df['economic_health'] = (
-        -1 * macro_df['UNRATE_zscore'] +  # Lower unemployment is better
-        -1 * macro_df['CPIAUCSL_zscore'] +  # Lower inflation is better
-        macro_df['INDPRO_zscore']  # Higher industrial production is better
-    ) / 3
                 
+                # Now create the economic health composite            
+                macro_df['economic_health'] = (
+                    -1 * macro_df['UNRATE_zscore'] +  # Lower unemployment is better
+                    -1 * macro_df['CPIAUCSL_zscore'] +  # Lower inflation is better
+                    macro_df['INDPRO_zscore']  # Higher industrial production is better
+                ) / 3
+                    
             # Monetary policy composite
             if all(col in macro_df.columns for col in ['T10Y2Y', 'FEDFUNDS', 'DGS10']):
                 # Make sure the trend columns are calculated first
@@ -610,24 +610,26 @@ class MarketFeatureExtractor:
                         macro_df[f'{col}_trend'] = macro_df[col].rolling(window=30).apply(
                             lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) > 5 else np.nan
                         )
+                
+                # Now create the monetary policy composite
+                macro_df['monetary_policy'] = (
+                    macro_df['T10Y2Y'] +  # Steeper yield curve suggests expansionary
+                    -1 * macro_df['FEDFUNDS_trend'] +  # Falling rates suggest expansionary
+                    -1 * macro_df['DGS10_trend']  # Falling long rates suggest accommodative
+                )
     
-    # Now create the monetary policy composite
-    macro_df['monetary_policy'] = (
-        macro_df['T10Y2Y'] +  # Steeper yield curve suggests expansionary
-        -1 * macro_df['FEDFUNDS_trend'] +  # Falling rates suggest expansionary
-        -1 * macro_df['DGS10_trend']  # Falling long rates suggest accommodative
-    )
             # Risk sentiment composite
             if 'VIXCLS' in macro_df.columns:
                 # Make sure the z-score is calculated first
                 if 'VIXCLS_zscore' not in macro_df.columns:
                     macro_df['VIXCLS_zscore'] = (macro_df['VIXCLS'] - macro_df['VIXCLS'].rolling(252).mean()) / macro_df['VIXCLS'].rolling(252).std()
                 
-    # Now create the risk sentiment composite
-    macro_df['risk_sentiment'] = -1 * macro_df['VIXCLS_zscore']  # Lower VIX implies risk-on
+                # Now create the risk sentiment composite
+                macro_df['risk_sentiment'] = -1 * macro_df['VIXCLS_zscore']  # Lower VIX implies risk-on
+    
             # Fill any remaining NaNs with zeros
             macro_df = macro_df.fillna(0)
-
+    
             print(f"Created macroeconomic feature dataframe with shape: {macro_df.shape}")
             return macro_df
         else:
