@@ -1163,6 +1163,25 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     latest_features = market_features[-last_n_days:]
     latest_dates = dates[-last_n_days:]
 
+    # Get the expected feature count from the model's market_feature_dim
+    expected_feature_dim = model.market_feature_dim
+    
+    # Check if we have a mismatch
+    if latest_features.shape[1] != expected_feature_dim:
+        print(f"Feature dimension mismatch: got {latest_features.shape[1]}, expected {expected_feature_dim}")
+        print("Adjusting feature dimensions to match training data...")
+        
+        # Create a properly sized array with zeros
+        adjusted_features = np.zeros((latest_features.shape[0], expected_feature_dim))
+        
+        # Copy available features (use the minimum to avoid index errors)
+        feat_count = min(latest_features.shape[1], expected_feature_dim)
+        adjusted_features[:, :feat_count] = latest_features[:, :feat_count]
+        
+        # Replace original features with adjusted ones
+        latest_features = adjusted_features
+        print(f"Adjusted feature shape: {latest_features.shape}")
+
     # Fetch latest news
     print("Fetching latest news...")
     latest_news = []
