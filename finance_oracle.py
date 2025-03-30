@@ -1028,10 +1028,9 @@ class ImprovedMarketModel(nn.Module):
         
         # Cross-modal feature fusion with gating mechanism
         self.news_projection = nn.Linear(news_embedding_dim + 1, hidden_dim)
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid()
-        )
+        
+        # FIX: Change fusion gate to work with each tensor separately
+        self.fusion_gate = nn.Linear(hidden_dim, hidden_dim)
         
         # Main sequence processing with GRU
         self.gru = nn.GRU(
@@ -1042,6 +1041,7 @@ class ImprovedMarketModel(nn.Module):
             bidirectional=True,
             dropout=dropout if num_layers > 1 else 0
         )
+
         
         # Hierarchical attention for time steps
         self.time_attention = nn.Sequential(
@@ -1087,9 +1087,14 @@ class ImprovedMarketModel(nn.Module):
         # Repeat for sequence length
         news_projected = news_projected.unsqueeze(1).repeat(1, seq_len, 1)
         
+        # FIX: Make sure dimensions match before concatenation
+        # Get the feature dimension
+        market_dim = market_encoded.size(-1)
+        news_dim = news_projected.size(-1)
+        
         # Gated fusion mechanism
-        combined_features = torch.cat([market_encoded, news_projected], dim=2)
-        gate_values = self.fusion_gate(combined_features)
+        # Instead of concatenating and using a linear layer, use element-wise operations
+        gate_values = torch.sigmoid(self.fusion_gate(market_encoded) + self.fusion_gate(news_projected))
         
         # Apply gating
         fused_features = market_encoded * gate_values + news_projected * (1 - gate_values)
