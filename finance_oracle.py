@@ -563,43 +563,68 @@ class MarketFeatureExtractor:
                 # Skip columns with too many NaNs
                 if macro_df[col].isna().sum() > len(macro_df) * 0.3:
                     continue
-
+            
                 # Percent changes for different time windows
                 macro_df[f'{col}_1m_change'] = macro_df[col].pct_change(periods=20)  # ~1 month
                 macro_df[f'{col}_3m_change'] = macro_df[col].pct_change(periods=60)  # ~3 months
-
+            
                 # Calculate trends (slope)
                 macro_df[f'{col}_trend'] = macro_df[col].rolling(window=30).apply(
                     lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) > 5 else np.nan
                 )
                 
-                # Z-scores to measure extremes
-                macro_df[f'{col}_zscore'] = (macro_df[col] - macro_df[col].rolling(252).mean()) / macro_df[col].rolling(252).std()
+                # Try-except block for Z-scores to handle potential division by zero
+                try:
+                    # Z-scores to measure extremes
+                    macro_df[f'{col}_zscore'] = (macro_df[col] - macro_df[col].rolling(252).mean()) / macro_df[col].rolling(252).std()
+                except:
+                    # If division by zero or other error, fill with zeros
+                    macro_df[f'{col}_zscore'] = 0
                 
                 # Rate of change acceleration
                 macro_df[f'{col}_acceleration'] = macro_df[f'{col}_1m_change'].diff(periods=20)
 
-            # Create composite indicators
+            # Economic health composite
             if all(col in macro_df.columns for col in ['UNRATE', 'CPIAUCSL', 'INDPRO']):
-                # Economic health composite
-                macro_df['economic_health'] = (
-                    -1 * macro_df['UNRATE_zscore'] +  # Lower unemployment is better
-                    -1 * macro_df['CPIAUCSL_zscore'] +  # Lower inflation is better
-                    macro_df['INDPRO_zscore']  # Higher industrial production is better
-                ) / 3
+                # Make sure the z-scores are calculated first
+                for col in ['UNRATE', 'CPIAUCSL', 'INDPRO']:
+                    col_zscore = f'{col}_zscore'
+                    if col_zscore not in macro_df.columns:
+                        # Calculate it if not already present
+                        macro_df[col_zscore] = (macro_df[col] - macro_df[col].rolling(252).mean()) / macro_df[col].rolling(252).std()
+            
+    # Now create the economic health composite            
+    macro_df['economic_health'] = (
+        -1 * macro_df['UNRATE_zscore'] +  # Lower unemployment is better
+        -1 * macro_df['CPIAUCSL_zscore'] +  # Lower inflation is better
+        macro_df['INDPRO_zscore']  # Higher industrial production is better
+    ) / 3
                 
+            # Monetary policy composite
             if all(col in macro_df.columns for col in ['T10Y2Y', 'FEDFUNDS', 'DGS10']):
-                # Monetary policy composite
-                macro_df['monetary_policy'] = (
-                    macro_df['T10Y2Y'] +  # Steeper yield curve suggests expansionary
-                    -1 * macro_df['FEDFUNDS_trend'] +  # Falling rates suggest expansionary
-                    -1 * macro_df['DGS10_trend']  # Falling long rates suggest accommodative
-                )
-                
+                # Make sure the trend columns are calculated first
+                for col in ['FEDFUNDS', 'DGS10']:
+                    col_trend = f'{col}_trend'
+                    if col_trend not in macro_df.columns:
+                        # Calculate it if not already present
+                        macro_df[f'{col}_trend'] = macro_df[col].rolling(window=30).apply(
+                            lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) > 5 else np.nan
+                        )
+    
+    # Now create the monetary policy composite
+    macro_df['monetary_policy'] = (
+        macro_df['T10Y2Y'] +  # Steeper yield curve suggests expansionary
+        -1 * macro_df['FEDFUNDS_trend'] +  # Falling rates suggest expansionary
+        -1 * macro_df['DGS10_trend']  # Falling long rates suggest accommodative
+    )
             # Risk sentiment composite
             if 'VIXCLS' in macro_df.columns:
-                macro_df['risk_sentiment'] = -1 * macro_df['VIXCLS_zscore']  # Lower VIX implies risk-on
-
+                # Make sure the z-score is calculated first
+                if 'VIXCLS_zscore' not in macro_df.columns:
+                    macro_df['VIXCLS_zscore'] = (macro_df['VIXCLS'] - macro_df['VIXCLS'].rolling(252).mean()) / macro_df['VIXCLS'].rolling(252).std()
+                
+    # Now create the risk sentiment composite
+    macro_df['risk_sentiment'] = -1 * macro_df['VIXCLS_zscore']  # Lower VIX implies risk-on
             # Fill any remaining NaNs with zeros
             macro_df = macro_df.fillna(0)
 
