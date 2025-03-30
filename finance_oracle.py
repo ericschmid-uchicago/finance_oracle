@@ -991,8 +991,8 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     model = MarketPredictionModel(
         market_feature_dim=market_feature_dim,
         news_embedding_dim=news_embedding_dim,
-        hidden_dim=128,
-        num_layers=2,
+        hidden_dim=512,  
+        num_layers=4,    
         dropout=0.3
     )
 
@@ -1026,7 +1026,7 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     # Setup mixed precision training if on GPU
     scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 
-    num_epochs = 30
+    num_epochs = 100
     start_time = time.time()
 
     for epoch in range(num_epochs):
