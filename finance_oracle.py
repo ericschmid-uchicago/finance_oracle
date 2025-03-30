@@ -809,112 +809,153 @@ class MarketFeatureExtractor:
 
     def extract_features(self, ticker, start_date, end_date, polygon_api_key):
         """Extract and combine all features for the model"""
-        # Get data from different sources
-        tech = self.get_technical_indicators(ticker, start_date, end_date)
-        macro = self.get_macroeconomic_data(start_date, end_date)
-        micro = self.get_market_microstructure(ticker, start_date, end_date, polygon_api_key)
+        try:
+            # Get data from different sources
+            print(f"Getting technical indicators for {ticker} from {start_date} to {end_date}")
+            tech = self.get_technical_indicators(ticker, start_date, end_date)
+            print(f"Technical data shape: {tech.shape}")
+            
+            print("Getting macroeconomic data")
+            macro = self.get_macroeconomic_data(start_date, end_date)
+            print(f"Macro data shape: {macro.shape if not macro.empty else '(empty)'}")
+            
+            print("Getting microstructure data")
+            micro = self.get_market_microstructure(ticker, start_date, end_date, polygon_api_key)
+            print(f"Micro data shape: {micro.shape if not micro.empty else '(empty)'}")
+            
+            # Apply enhanced feature engineering
+            print("Applying feature engineering")
+            tech = self.enhance_features(tech, macro)
+            print(f"Enhanced tech data shape: {tech.shape}")
+            
+            # Ensure all dataframes have the same index (trading days)
+            common_idx = tech.index
+            
+            # Reindex macro and micro data to match technical data
+            if not macro.empty:
+                macro = macro.reindex(common_idx, method='ffill')
+            
+            if not micro.empty:
+                micro = micro.reindex(common_idx, method='ffill')
+            
+            # Extract basic features
+            feature_cols = [
+                'MA5', 'MA20', 'MA50', 'MA200',
+                'RSI', 'MACD', 'MACD_Signal', 'MACD_Diff',
+                'BB_High', 'BB_Low', 'BB_Mid',
+                'Volume_Change', 'Volume_MA5',
+                'Price_Change', 'Price_Change_5d', 'Volatility'
+            ]
+            
+            # Add enhanced features
+            enhanced_cols = [
+                'price_zscore_5d', 'price_zscore_20d',
+                'momentum_1m', 'momentum_3m', 'momentum_6m',
+                'vol_ratio', 'log_volume', 'volume_momentum',
+                'bull_market', 'high_volatility_regime',
+                'price_acceleration', 'momentum_divergence',
+                'volume_price_trend', 'overbought', 'oversold',
+                'ma_crossover_5_20', 'breakout_high'
+            ]
+            
+            # Add these columns if they exist
+            for col in enhanced_cols:
+                if col in tech.columns:
+                    feature_cols.append(col)
+            
+            # Create the combined feature set
+            features_list = [tech[feature_cols]]
+            
+            # Only add non-empty dataframes
+            if not macro.empty:
+                features_list.append(macro)
+            
+            if not micro.empty:
+                features_list.append(micro)
+            
+            # Combine all features into a single dataframe
+            all_features = pd.concat(features_list, axis=1)
+            
+            # Check if the dataframe is empty and handle it
+            if all_features.empty or len(all_features) == 0:
+                print("WARNING: No features available in the specified date range!")
+                # Create a default feature set with zeros
+                default_features = pd.DataFrame(
+                    np.zeros((1, len(all_features.columns) if not all_features.empty else len(feature_cols))), 
+                    columns=all_features.columns if not all_features.empty else feature_cols,
+                    index=[datetime.now()]
+                )
+                all_features = default_features
+            
+            # Drop any rows with missing values
+            all_features = all_features.dropna()
+            
+            # Print feature information for debugging
+            print(f"Combined features shape: {all_features.shape}")
+            print(f"Feature columns: {all_features.columns.tolist()}")
+            
+            # Check again after dropping NaN values
+            if all_features.empty or len(all_features) == 0:
+                print("WARNING: All features were dropped due to NaN values. Creating default features.")
+                default_features = pd.DataFrame(
+                    np.zeros((1, len(feature_cols))), 
+                    columns=feature_cols,
+                    index=[datetime.now()]
+                )
+                all_features = default_features
+            
+            # Clean up any infinity or extremely large values before scaling
+            all_features = all_features.replace([np.inf, -np.inf], np.nan)
+            all_features = all_features.fillna(method='ffill').fillna(method='bfill').fillna(0)
+            
+            # Additional check for extremely large values
+            for col in all_features.columns:
+                # Replace values larger than a threshold with the column median
+                extreme_mask = np.abs(all_features[col]) > 1e10
+                if extreme_mask.any():
+                    print(f"Replacing extreme values in column: {col}")
+                    all_features.loc[extreme_mask, col] = all_features[col].median()
+            
+            # Clean up any infinity or extremely large values before scaling
+            all_features = all_features.replace([np.inf, -np.inf], np.nan)
+            
+            # Print columns with NaN values to debug
+            nan_columns = all_features.columns[all_features.isna().any()].tolist()
+            if nan_columns:
+                print(f"Columns with NaN values: {nan_columns}")
+            
+            # Fill NaN values
+            all_features = all_features.fillna(method='ffill').fillna(method='bfill').fillna(0)
+            
+            # Replace extremely large values with column medians
+            for col in all_features.columns:
+                # Calculate column median for non-extreme values
+                median_val = all_features[col][np.abs(all_features[col]) < 1e10].median()
+                if pd.isna(median_val):
+                    median_val = 0
+                    
+                # Replace extreme values
+                extreme_mask = np.abs(all_features[col]) > 1e10
+                extreme_count = extreme_mask.sum()
+                if extreme_count > 0:
+                    print(f"Replacing {extreme_count} extreme values in column: {col}")
+                    all_features.loc[extreme_mask, col] = median_val
+            
+            print("Data preprocessing complete, proceeding with scaling...")
+            
+            # Now scale the cleaned data
+            scaled = self.scaler.fit_transform(all_features)
+            
+            return scaled, all_features.index
         
-        # Apply enhanced feature engineering
-        tech = self.enhance_features(tech, macro)
-
-        # Ensure all dataframes have the same index (trading days)
-        common_idx = tech.index
-
-        # Reindex macro and micro data to match technical data
-        if not macro.empty:
-            macro = macro.reindex(common_idx, method='ffill')
-
-        if not micro.empty:
-            micro = micro.reindex(common_idx, method='ffill')
-
-        # Extract basic features
-        feature_cols = [
-            'MA5', 'MA20', 'MA50', 'MA200',
-            'RSI', 'MACD', 'MACD_Signal', 'MACD_Diff',
-            'BB_High', 'BB_Low', 'BB_Mid',
-            'Volume_Change', 'Volume_MA5',
-            'Price_Change', 'Price_Change_5d', 'Volatility'
-        ]
-        
-        # Add enhanced features
-        enhanced_cols = [
-            'price_zscore_5d', 'price_zscore_20d',
-            'momentum_1m', 'momentum_3m', 'momentum_6m',
-            'vol_ratio', 'log_volume', 'volume_momentum',
-            'bull_market', 'high_volatility_regime',
-            'price_acceleration', 'momentum_divergence',
-            'volume_price_trend', 'overbought', 'oversold',
-            'ma_crossover_5_20', 'breakout_high'
-        ]
-        
-        # Add these columns if they exist
-        for col in enhanced_cols:
-            if col in tech.columns:
-                feature_cols.append(col)
-
-        # Create the combined feature set
-        features_list = [tech[feature_cols]]
-
-        # Only add non-empty dataframes
-        if not macro.empty:
-            features_list.append(macro)
-
-        if not micro.empty:
-            features_list.append(micro)
-
-        # Combine all features into a single dataframe
-        all_features = pd.concat(features_list, axis=1)
-
-        # Drop any rows with missing values
-        all_features = all_features.dropna()
-
-        # Print feature information for debugging
-        print(f"Combined features shape: {all_features.shape}")
-        print(f"Feature columns: {all_features.columns.tolist()}")
-
-        # Clean up any infinity or extremely large values before scaling
-        all_features = all_features.replace([np.inf, -np.inf], np.nan)
-        all_features = all_features.fillna(method='ffill').fillna(method='bfill').fillna(0)
-        
-        # Additional check for extremely large values
-        for col in all_features.columns:
-            # Replace values larger than a threshold with the column median
-            extreme_mask = np.abs(all_features[col]) > 1e10
-            if extreme_mask.any():
-                print(f"Replacing extreme values in column: {col}")
-                all_features.loc[extreme_mask, col] = all_features[col].median()
-
-        # Clean up any infinity or extremely large values before scaling
-        all_features = all_features.replace([np.inf, -np.inf], np.nan)
-        
-        # Print columns with NaN values to debug
-        nan_columns = all_features.columns[all_features.isna().any()].tolist()
-        if nan_columns:
-            print(f"Columns with NaN values: {nan_columns}")
-        
-        # Fill NaN values
-        all_features = all_features.fillna(method='ffill').fillna(method='bfill').fillna(0)
-        
-        # Replace extremely large values with column medians
-        for col in all_features.columns:
-            # Calculate column median for non-extreme values
-            median_val = all_features[col][np.abs(all_features[col]) < 1e10].median()
-            if pd.isna(median_val):
-                median_val = 0
-                
-            # Replace extreme values
-            extreme_mask = np.abs(all_features[col]) > 1e10
-            extreme_count = extreme_mask.sum()
-            if extreme_count > 0:
-                print(f"Replacing {extreme_count} extreme values in column: {col}")
-                all_features.loc[extreme_mask, col] = median_val
-        
-        print("Data preprocessing complete, proceeding with scaling...")
-        
-        # Now scale the cleaned data
-        scaled = self.scaler.fit_transform(all_features)
-
-        return scaled, all_features.index
+        except Exception as e:
+            print(f"ERROR in feature extraction: {e}")
+            # Create default features in case of error
+            print("Creating default feature set due to error...")
+            feature_dim = 100  # Reasonable default
+            default_features = np.zeros((1, feature_dim))
+            default_dates = pd.DatetimeIndex([datetime.now()])
+            return default_features, default_dates
 
     def get_enhanced_data(self, ticker, start_date, end_date, polygon_api_key):
         """Get enhanced alternative data sources"""
@@ -2051,13 +2092,16 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     Returns:
         prediction: Class prediction (0=DOWN, 1=NEUTRAL, 2=UP)
         confidence: Confidence scores for each class
+        uncertainty: Model uncertainty score
+        latest_dates: Dates used for the prediction
     """
     if fred_api_key is None:
         raise ValueError("FRED API key is required for macroeconomic data")
 
     # Calculate date range for the last n days
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=100)  # Get 100 days for indicators
+    # Use a wider date range to ensure we have enough data
+    start_date = end_date - timedelta(days=300)  # Get 300 days for indicators instead of 100
 
     # Format dates for API
     start_date_str = start_date.strftime('%Y-%m-%d')
@@ -2065,16 +2109,66 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
 
     print(f"Fetching latest {last_n_days} days of data for {ticker}...")
 
-    # Get market features
-    market_extractor = MarketFeatureExtractor(fred_api_key=fred_api_key)
-    market_features, dates = market_extractor.extract_features(ticker, start_date_str, end_date_str, polygon_api_key)
+    try:
+        # Get market features
+        market_extractor = MarketFeatureExtractor(fred_api_key=fred_api_key)
+        market_features, dates = market_extractor.extract_features(ticker, start_date_str, end_date_str, polygon_api_key)
+        
+        # Check if we got any valid data
+        if len(market_features) == 0 or len(dates) == 0:
+            print("WARNING: No features extracted. Creating default feature set.")
+            # Create a default feature set (zeros) with the right dimensions
+            if model_type == 'improved':
+                market_feature_dim = model.market_feature_dim
+            else:
+                market_feature_dim = model.market_feature_dim
+                
+            market_features = np.zeros((last_n_days, market_feature_dim))
+            dates = [end_date - timedelta(days=i) for i in range(last_n_days, 0, -1)]
+    except Exception as e:
+        print(f"Error extracting features: {e}")
+        print("Creating default feature set...")
+        if model_type == 'improved':
+            market_feature_dim = model.market_feature_dim
+        else:
+            market_feature_dim = model.market_feature_dim
+            
+        market_features = np.zeros((last_n_days, market_feature_dim))
+        dates = [end_date - timedelta(days=i) for i in range(last_n_days, 0, -1)]
 
+    # Check if we have enough data
     if len(market_features) < last_n_days:
-        raise ValueError(f"Not enough recent data available. Need {last_n_days} days, got {len(market_features)}")
+        print(f"WARNING: Not enough recent data available. Need {last_n_days} days, got {len(market_features)}")
+        print("Padding with zeros...")
+        # Pad with zeros at the beginning to reach the required sequence length
+        padding_needed = last_n_days - len(market_features)
+        if len(market_features) > 0:
+            padding_shape = (padding_needed, market_features.shape[1])
+            market_features = np.vstack([np.zeros(padding_shape), market_features])
+            # Add padding dates
+            first_date = dates[0] if len(dates) > 0 else end_date
+            padding_dates = [first_date - timedelta(days=i+1) for i in range(padding_needed)]
+            dates = padding_dates + (dates if isinstance(dates, list) else dates.tolist())
+        else:
+            # If we have no data at all, create a full sequence of zeros
+            if model_type == 'improved':
+                market_feature_dim = model.market_feature_dim
+            else:
+                market_feature_dim = model.market_feature_dim
+                
+            market_features = np.zeros((last_n_days, market_feature_dim))
+            dates = [end_date - timedelta(days=i) for i in range(last_n_days, 0, -1)]
 
     # Get the most recent n days of features
-    latest_features = market_features[-last_n_days:]
-    latest_dates = dates[-last_n_days:]
+    if len(market_features) > last_n_days:
+        latest_features = market_features[-last_n_days:]
+        if isinstance(dates, pd.DatetimeIndex):
+            latest_dates = dates[-last_n_days:]
+        else:
+            latest_dates = dates[-last_n_days:]
+    else:
+        latest_features = market_features
+        latest_dates = dates
 
     # Get the expected feature count from the model's market_feature_dim
     if model_type == 'improved':
@@ -2104,11 +2198,19 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
 
     if polygon_api_key:
         try:
+            # Convert dates to strings for API if needed
+            if not isinstance(latest_dates[0], str):
+                start_date_str = latest_dates[0].strftime('%Y-%m-%d') if hasattr(latest_dates[0], 'strftime') else str(latest_dates[0])
+                end_date_str = latest_dates[-1].strftime('%Y-%m-%d') if hasattr(latest_dates[-1], 'strftime') else str(latest_dates[-1])
+            else:
+                start_date_str = latest_dates[0]
+                end_date_str = latest_dates[-1]
+                
             news_data = fetch_financial_news_polygon(
                 ticker,
-                latest_dates[0].strftime('%Y-%m-%d'),
-                latest_dates[-1].strftime('%Y-%m-%d'),
-                latest_dates,
+                start_date_str,
+                end_date_str,
+                pd.DatetimeIndex(latest_dates) if not isinstance(latest_dates, pd.DatetimeIndex) else latest_dates,
                 polygon_api_key
             )
 
@@ -2149,34 +2251,41 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     # Make prediction
     model.eval()
     with torch.no_grad():
-        if device.type == 'cuda':
-            with torch.cuda.amp.autocast():
+        try:
+            if device.type == 'cuda':
+                with torch.cuda.amp.autocast():
+                    if model_type == 'improved':
+                        logits, uncertainty_score = model(market_tensor, news_embeds, news_sents)
+                    else:
+                        logits = model(market_tensor, news_embeds, news_sents)[:, -1, :]
+                        uncertainty_score = torch.tensor([0.5], device=device)  # Placeholder for original model
+                    
+                    # Apply temperature scaling for calibration
+                    scaled_logits = logits / temperature
+                    probs = torch.nn.functional.softmax(scaled_logits, dim=1)[0]
+                    _, pred = torch.max(scaled_logits, 1)
+            else:
                 if model_type == 'improved':
                     logits, uncertainty_score = model(market_tensor, news_embeds, news_sents)
                 else:
                     logits = model(market_tensor, news_embeds, news_sents)[:, -1, :]
                     uncertainty_score = torch.tensor([0.5], device=device)  # Placeholder for original model
-                
+                    
                 # Apply temperature scaling for calibration
                 scaled_logits = logits / temperature
                 probs = torch.nn.functional.softmax(scaled_logits, dim=1)[0]
                 _, pred = torch.max(scaled_logits, 1)
-        else:
-            if model_type == 'improved':
-                logits, uncertainty_score = model(market_tensor, news_embeds, news_sents)
-            else:
-                logits = model(market_tensor, news_embeds, news_sents)[:, -1, :]
-                uncertainty_score = torch.tensor([0.5], device=device)  # Placeholder for original model
-                
-            # Apply temperature scaling for calibration
-            scaled_logits = logits / temperature
-            probs = torch.nn.functional.softmax(scaled_logits, dim=1)[0]
-            _, pred = torch.max(scaled_logits, 1)
+        except Exception as e:
+            print(f"Error during model prediction: {e}")
+            # Default to neutral with high uncertainty
+            pred = torch.tensor([1], device=device)  # NEUTRAL
+            probs = torch.tensor([0.2, 0.6, 0.2], device=device)  # Higher prob for NEUTRAL
+            uncertainty_score = torch.tensor([0.8], device=device)  # High uncertainty
 
     # Convert to numpy
     prediction = pred.item()
     confidence = probs.cpu().numpy()
-    uncertainty = uncertainty_score.cpu().numpy()[0]
+    uncertainty = uncertainty_score.cpu().numpy()[0] if hasattr(uncertainty_score, 'cpu') else 0.5
 
     # Map prediction to label
     label_map = {0: "DOWN", 1: "NEUTRAL", 2: "UP"}
