@@ -2322,16 +2322,35 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     # Convert to numpy
     prediction = pred.item()
     confidence = probs.cpu().numpy()
-    uncertainty = uncertainty_score.cpu().numpy()[0] if hasattr(uncertainty_score, 'cpu') else 0.5
-
+    uncertainty = float(uncertainty_score.cpu().numpy())  # Convert to float here
+    
     # Map prediction to label
     label_map = {0: "DOWN", 1: "NEUTRAL", 2: "UP"}
-
+    
     print(f"Prediction for next day: {label_map[prediction]}")
     print(f"Confidence: DOWN={confidence[0]:.2f}, NEUTRAL={confidence[1]:.2f}, UP={confidence[2]:.2f}")
-    print(f"Model uncertainty: {float(uncertainty):.2f} (lower is better)")
-
-    return prediction, confidence, uncertainty, latest_dates
+    print(f"Model uncertainty: {uncertainty:.2f} (lower is better)")
+    
+    # Calculate confidence-adjusted prediction
+    if max(confidence) < 0.45:  # If no class has clear confidence
+        adj_prediction = 1  # Default to NEUTRAL
+        print("Low confidence prediction, defaulting to NEUTRAL stance")
+    else:
+        adj_prediction = prediction
+    
+    # Add some market context to the prediction
+    print("\nMarket Context:")
+    if 'bull_market' in market_features[-1] and market_features[-1]['bull_market'] > 0.5:
+        print("- Currently in a bull market regime")
+    elif 'bull_market' in market_features[-1]:
+        print("- Currently in a bear market regime")
+    
+    if 'volatility_regime' in market_features[-1] and market_features[-1]['volatility_regime'] > 0.5:
+        print("- High volatility environment")
+    else:
+        print("- Normal volatility environment")
+    
+    return adj_prediction, confidence, uncertainty, latest_dates
 
 
 # --------------------- Create Ensemble of Models ---------------------
