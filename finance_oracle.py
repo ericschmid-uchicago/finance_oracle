@@ -1582,17 +1582,29 @@ def calibrate_predictions(model, val_loader, temperature=1.0):
     
     # Calculate ECE
     ece = 0
+    bin_counts = np.zeros(M)
+    
+    for i in range(len(confidences)):
+        conf = confidences[i]
+        acc = accuracies[i]
+        # Find which bin this confidence falls into
+        for m in range(M):
+            if conf > bins[m] and conf <= bins[m+1]:
+                bin_counts[m] += 1
+                break
+    
     for m in range(M):
-        in_bin = np.logical_and(confidences > bins[m], confidences <= bins[m+1])
-        if np.sum(in_bin) > 0:
-            # Make sure arrays have the same length before indexing
-            if len(in_bin) == len(accuracies):
-                accuracy_in_bin = np.mean(accuracies[in_bin])
-                confidence_in_bin = np.mean(confidences[in_bin])
-                ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(confidences))
-            else:
-                print(f"Warning: Size mismatch in bin {m}. Skipping this bin.")
-                print(f"in_bin length: {len(in_bin)}, accuracies length: {len(accuracies)}")
+        # Get indices of samples in this bin
+        in_bin_indices = []
+        for i in range(len(confidences)):
+            if confidences[i] > bins[m] and confidences[i] <= bins[m+1]:
+                in_bin_indices.append(i)
+        
+        if len(in_bin_indices) > 0:
+            accuracy_in_bin = np.mean([accuracies[i] for i in in_bin_indices])
+            confidence_in_bin = np.mean([confidences[i] for i in in_bin_indices])
+            ece += np.abs(accuracy_in_bin - confidence_in_bin) * (len(in_bin_indices) / len(confidences))
+    
     print(f"Expected Calibration Error: {ece:.4f}")
     
     # If ECE is high, adjust temperature
@@ -1602,19 +1614,32 @@ def calibrate_predictions(model, val_loader, temperature=1.0):
         best_temp = temperature
         
         for temp in [0.5, 0.8, 1.2, 1.5, 2.0, 3.0]:
-            temp_tensor = torch.tensor(temp, device=device)
-            scaled_logits = logits / temp_tensor
-            new_probs = F.softmax(scaled_logits, dim=1).cpu().numpy()
-            new_confidences = np.max(new_probs, axis=1)
-            
-            # Calculate new ECE
+            # Calculate new calibration with this temperature
             new_ece = 0
-            for m in range(M):
-                in_bin = np.logical_and(new_confidences > bins[m], new_confidences <= bins[m+1])
-                if np.sum(in_bin) > 0:
-                    accuracy_in_bin = np.mean(accuracies[in_bin])
-                    confidence_in_bin = np.mean(new_confidences[in_bin])
-                    new_ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(new_confidences))
+            for batch in val_loader:
+                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                
+                if isinstance(model, ImprovedMarketModel):
+                    logits, _ = model(market_feats, news_embeds, news_sents)
+                else:
+                    logits = model(market_feats, news_embeds, news_sents)[:, -1, :]
+                
+                # Apply new temperature
+                scaled_logits = logits / temp
+                new_probs = F.softmax(scaled_logits, dim=1).cpu().numpy()
+                
+                # Track metrics for this batch
+                batch_confidences = np.max(new_probs, axis=1)
+                batch_predictions = np.argmax(new_probs, axis=1)
+                batch_accuracies = (batch_predictions == label_batch.cpu().numpy())
+                
+                # Calculate ECE contribution from this batch
+                for m in range(M):
+                    in_bin = np.logical_and(batch_confidences > bins[m], batch_confidences <= bins[m+1])
+                    if np.sum(in_bin) > 0:
+                        accuracy_in_bin = np.mean(batch_accuracies[in_bin])
+                        confidence_in_bin = np.mean(batch_confidences[in_bin])
+                        new_ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(batch_confidences))
             
             if new_ece < best_ece:
                 best_ece = new_ece
