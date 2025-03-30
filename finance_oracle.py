@@ -15,6 +15,9 @@ import json
 from fredapi import Fred
 warnings.filterwarnings('ignore')
 from datetime import datetime, timedelta
+import optuna
+from sklearn.metrics import f1_score
+import numpy as np
 
 # Check for CUDA availability and configure PyTorch
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -841,10 +844,171 @@ class TensorDataset(Dataset):
         )
 
 
+def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_test, 
+                               market_feature_dim, news_embedding_dim, seed=42):
+    """
+    Perform hyperparameter optimization using Optuna
+    
+    Args:
+        X_train, X_test: Market features for training and testing
+        nf_train, nf_test: News features for training and testing  
+        y_train, y_test: Target labels
+        market_feature_dim: Dimension of market features
+        news_embedding_dim: Dimension of news embeddings
+        seed: Random seed for reproducibility
+        
+    Returns:
+        dict: Best hyperparameters
+    """
+    # Create datasets
+    train_dataset = TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor([f['embeddings'] for f in nf_train], dtype=torch.float32),
+        torch.tensor([f['sentiment_scores'] for f in nf_train], dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.long)
+    )
+    test_dataset = TensorDataset(
+        torch.tensor(X_test, dtype=torch.float32),
+        torch.tensor([f['embeddings'] for f in nf_test], dtype=torch.float32),
+        torch.tensor([f['sentiment_scores'] for f in nf_test], dtype=torch.float32),
+        torch.tensor(y_test, dtype=torch.long)
+    )
+    
+    def objective(trial):
+        # Define the hyperparameters to search
+        hidden_dim = trial.suggest_categorical("hidden_dim", [128, 256, 512, 768])
+        num_layers = trial.suggest_int("num_layers", 1, 4)
+        dropout = trial.suggest_float("dropout", 0.1, 0.5)
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+        
+        # Class weights
+        down_weight = trial.suggest_float("down_weight", 0.5, 3.0)
+        neutral_weight = trial.suggest_float("neutral_weight", 0.5, 3.0)
+        up_weight = trial.suggest_float("up_weight", 0.5, 3.0)
+        
+        # Print the current trial configuration
+        print(f"Trial {trial.number}: Testing {hidden_dim=}, {num_layers=}, {dropout=}, {learning_rate=}, {batch_size=}")
+        print(f"Class weights: DOWN={down_weight}, NEUTRAL={neutral_weight}, UP={up_weight}")
+        
+        # Create model with these hyperparameters
+        model = MarketPredictionModel(
+            market_feature_dim=market_feature_dim,
+            news_embedding_dim=news_embedding_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        
+        # Create dataloaders with the selected batch size
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size*2, shuffle=False)
+        
+        # Set up loss function with class weights
+        class_weights = torch.tensor([down_weight, neutral_weight, up_weight], device=device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        
+        # Set up optimizer with the selected learning rate
+        optimizer = AdamW(model.parameters(), lr=learning_rate)
+        
+        # Move model to device
+        model.to(device)
+        
+        # Train (we'll do fewer epochs for the optimization)
+        max_epochs = 30
+        patience = 5  # Early stopping patience
+        best_val_loss = float('inf')
+        no_improve_epochs = 0
+        
+        for epoch in range(max_epochs):
+            model.train()
+            total_loss = 0
+            
+            for batch in train_loader:
+                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                
+                outputs = model(market_feats, news_embeds, news_sents)
+                loss = criterion(outputs[:, -1, :], label_batch)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(train_loader)
+            print(f"Epoch {epoch+1}/{max_epochs}, Loss: {avg_loss:.4f}")
+            
+            # Validation
+            model.eval()
+            val_loss = 0
+            all_preds = []
+            all_labels = []
+            
+            with torch.no_grad():
+                for batch in test_loader:
+                    market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                    outputs = model(market_feats, news_embeds, news_sents)
+                    loss = criterion(outputs[:, -1, :], label_batch)
+                    val_loss += loss.item()
+                    
+                    # Get predictions
+                    _, predicted = torch.max(outputs[:, -1, :], 1)
+                    
+                    all_preds.extend(predicted.cpu().numpy())
+                    all_labels.extend(label_batch.cpu().numpy())
+            
+            avg_val_loss = val_loss / len(test_loader)
+            f1 = f1_score(all_labels, all_preds, average='weighted')
+            print(f"Validation Loss: {avg_val_loss:.4f}, F1 Score: {f1:.4f}")
+            
+            # Early stopping check
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+                if no_improve_epochs >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+        
+        # Final evaluation
+        model.eval()
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                outputs = model(market_feats, news_embeds, news_sents)
+                
+                _, predicted = torch.max(outputs[:, -1, :], 1)
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(label_batch.cpu().numpy())
+        
+        # Calculate performance metrics
+        accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
+        f1 = f1_score(all_labels, all_preds, average='weighted')
+        
+        print(f"Trial {trial.number} - Accuracy: {accuracy:.4f}, F1 Score: {f1:.4f}")
+        
+        return f1  # Optimize for F1 score, which balances precision and recall
+
+    # Run hyperparameter optimization
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=10)  # Adjust number of trials based on time constraints
+    
+    # Print best parameters
+    print("Best hyperparameters:", study.best_params)
+    print("Best F1 score:", study.best_value)
+    
+    return study.best_params
+
 # --------------------- Main Training + Backtest ---------------------
 def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='2025-03-29',
-                                seq_length=10, max_articles=5, polygon_api_key=None,
-                                historical_news_data=None, fred_api_key=None):
+                             seq_length=10, max_articles=5, polygon_api_key=None,
+                             historical_news_data=None, fred_api_key=None, 
+                             run_optimization=False):
     """
     1) Fetch price data + technical indicators for the entire date range (must >= 50 days).
     2) Use provided historical news data or fetch news from Polygon API.
@@ -988,13 +1152,46 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     market_feature_dim = X_train.shape[2]  # e.g. how many features after scaling
     news_embedding_dim = nf_train[0]['embeddings'].shape[1]  # 768 typically
 
+    if run_optimization:
+        print("Running hyperparameter optimization...")
+        best_params = hyperparameter_optimization(
+            X_train, X_test, nf_train, nf_test, y_train, y_test,
+            market_feature_dim, news_embedding_dim
+        )
+        
+        hidden_dim = best_params["hidden_dim"]
+        num_layers = best_params["num_layers"]
+        dropout = best_params["dropout"]
+        learning_rate = best_params["learning_rate"]
+        batch_size = best_params["batch_size"]
+        
+        # Class weights
+        down_weight = best_params["down_weight"]
+        neutral_weight = best_params["neutral_weight"]
+        up_weight = best_params["up_weight"]
+        
+        print(f"Using optimized parameters: {hidden_dim=}, {num_layers=}, {dropout=}, {learning_rate=}, {batch_size=}")
+        print(f"Class weights: DOWN={down_weight}, NEUTRAL={neutral_weight}, UP={up_weight}")
+    else:
+        # Default parameters
+        hidden_dim = 512
+        num_layers = 4
+        dropout = 0.3
+        learning_rate = 0.001
+        batch_size = 32
+        down_weight = 1.0
+        neutral_weight = 1.0
+        up_weight = 1.0
+    
+    # --- Build the LSTM model ---
     model = MarketPredictionModel(
         market_feature_dim=market_feature_dim,
         news_embedding_dim=news_embedding_dim,
-        hidden_dim=512,  
-        num_layers=4,    
-        dropout=0.5
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout
     )
+    
 
     # --- Build PyTorch datasets ---
     train_dataset = TensorDataset(
@@ -1014,12 +1211,12 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     batch_size = 128 if torch.cuda.is_available() else 32
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader  = DataLoader(test_dataset, batch_size=batch_size*2, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size*2, shuffle=False)
 
     # --- Train ---
-    class_weights = torch.tensor([1.5, 2.0, 1.0], device=device)
+    class_weights = torch.tensor([down_weight, neutral_weight, up_weight], device=device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = AdamW(model.parameters(), lr=0.001)
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
 
     # Move model to GPU
     model.to(device)
@@ -1287,7 +1484,8 @@ if __name__ == "__main__":
     total_articles = sum(len(articles) for articles in historical_news.values())
     print(f"Successfully fetched {total_articles} historical news articles for SPY")
 
-    # Run model training with all data sources
+    run_optimization = True  # Set to False after finding optimal parameters
+    
     model, accuracy, market_feats, all_news, all_dates, evaluation = train_and_backtest_model(
         ticker="SPY",
         start_date=start_date,
@@ -1296,7 +1494,8 @@ if __name__ == "__main__":
         max_articles=5,
         polygon_api_key=polygon_api_key,
         historical_news_data=historical_news,
-        fred_api_key=fred_api_key
+        fred_api_key=fred_api_key,
+        run_optimization=run_optimization  # Add this parameter
     )
 
     print(f"\nFinal Backtest Accuracy: {accuracy:.4f}")
