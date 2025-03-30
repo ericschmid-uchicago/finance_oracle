@@ -1010,7 +1010,7 @@ class ImprovedMarketModel(nn.Module):
         # Transformer encoder for time series
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=market_feature_dim,
-            nhead=4,  # Multi-head attention
+            nhead=4 if market_feature_dim >= 8 else 1,  # Ensure nhead divides feature dimension
             dim_feedforward=hidden_dim,
             dropout=dropout,
             batch_first=True
@@ -1026,11 +1026,18 @@ class ImprovedMarketModel(nn.Module):
             nn.Softmax(dim=1)
         )
         
-        # Cross-modal feature fusion with gating mechanism
-        self.news_projection = nn.Linear(news_embedding_dim + 1, hidden_dim)
+        # Project news to match market features dimension first
+        self.news_projection = nn.Linear(news_embedding_dim + 1, market_feature_dim)
         
-        # FIX: Change fusion gate to work with each tensor separately
-        self.fusion_gate = nn.Linear(hidden_dim, hidden_dim)
+        # Project both to hidden dimension separately
+        self.market_projection = nn.Linear(market_feature_dim, hidden_dim)
+        self.news_hidden_projection = nn.Linear(market_feature_dim, hidden_dim)
+        
+        # Gating mechanism
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid()
+        )
         
         # Main sequence processing with GRU
         self.gru = nn.GRU(
@@ -1041,7 +1048,6 @@ class ImprovedMarketModel(nn.Module):
             bidirectional=True,
             dropout=dropout if num_layers > 1 else 0
         )
-
         
         # Hierarchical attention for time steps
         self.time_attention = nn.Sequential(
@@ -1081,23 +1087,22 @@ class ImprovedMarketModel(nn.Module):
         avg_sentiment = torch.mean(news_sentiment, dim=1)
         news_with_sentiment = torch.cat([attended_news, avg_sentiment], dim=1)
         
-        # Project news to same dimension as market features
+        # Project news to match market features dimension
         news_projected = self.news_projection(news_with_sentiment)
         
         # Repeat for sequence length
         news_projected = news_projected.unsqueeze(1).repeat(1, seq_len, 1)
         
-        # FIX: Make sure dimensions match before concatenation
-        # Get the feature dimension
-        market_dim = market_encoded.size(-1)
-        news_dim = news_projected.size(-1)
+        # Project both to hidden dimension
+        market_hidden = self.market_projection(market_encoded)
+        news_hidden = self.news_hidden_projection(news_projected)
         
-        # Gated fusion mechanism
-        # Instead of concatenating and using a linear layer, use element-wise operations
-        gate_values = torch.sigmoid(self.fusion_gate(market_encoded) + self.fusion_gate(news_projected))
+        # Concatenate for gating
+        combined = torch.cat([market_hidden, news_hidden], dim=2)
+        gate_values = self.gate(combined)
         
         # Apply gating
-        fused_features = market_encoded * gate_values + news_projected * (1 - gate_values)
+        fused_features = market_hidden * gate_values + news_hidden * (1 - gate_values)
         
         # Process with GRU
         gru_out, _ = self.gru(fused_features)
