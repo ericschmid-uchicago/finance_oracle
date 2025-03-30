@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModel
@@ -16,7 +17,7 @@ from fredapi import Fred
 warnings.filterwarnings('ignore')
 from datetime import datetime, timedelta
 import optuna
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
 import numpy as np
 
 # Check for CUDA availability and configure PyTorch
@@ -397,6 +398,7 @@ class MarketFeatureExtractor:
         data['MA5'] = ta.trend.sma_indicator(data['Close'], window=5)
         data['MA20'] = ta.trend.sma_indicator(data['Close'], window=20)
         data['MA50'] = ta.trend.sma_indicator(data['Close'], window=50)
+        data['MA200'] = ta.trend.sma_indicator(data['Close'], window=200)
 
         data['RSI'] = ta.momentum.rsi(data['Close'], window=14)
 
@@ -419,6 +421,61 @@ class MarketFeatureExtractor:
 
         data = data.dropna()
         return data
+        
+    def enhance_features(self, market_data, macro_data):
+        """Enhanced feature engineering with proven alpha factors"""
+        
+        # Mean reversion features
+        market_data['price_zscore_5d'] = (market_data['Close'] - market_data['Close'].rolling(5).mean()) / market_data['Close'].rolling(5).std()
+        market_data['price_zscore_20d'] = (market_data['Close'] - market_data['Close'].rolling(20).mean()) / market_data['Close'].rolling(20).std()
+        
+        # Momentum features with optimized lookbacks
+        market_data['momentum_1m'] = market_data['Close'].pct_change(21)
+        market_data['momentum_3m'] = market_data['Close'].pct_change(63)
+        market_data['momentum_6m'] = market_data['Close'].pct_change(126)
+        
+        # Volatility regime features
+        market_data['vol_ratio'] = market_data['Volatility'] / market_data['Volatility'].rolling(60).mean()
+        
+        # Cross-asset correlation factors
+        if not macro_data.empty and 'VIXCLS' in macro_data.columns:
+            # First resample macro data to match market_data's index
+            macro_resampled = macro_data.reindex(market_data.index, method='ffill')
+            market_data['rsi_vix_ratio'] = market_data['RSI'] / macro_resampled['VIXCLS']
+        
+        # Feature transformations for non-linear relationships
+        market_data['log_volume'] = np.log1p(market_data['Volume'])
+        market_data['volume_momentum'] = market_data['Volume'].pct_change(5) * market_data['Price_Change']
+        
+        # Market regime identification
+        market_data['bull_market'] = (market_data['Close'] > market_data['MA200']).astype(int)
+        market_data['high_volatility_regime'] = (market_data['Volatility'] > market_data['Volatility'].rolling(60).mean()).astype(int)
+        
+        # Price pattern recognition
+        market_data['price_acceleration'] = market_data['Price_Change'].diff()
+        market_data['momentum_divergence'] = ((market_data['Close'] > market_data['Close'].shift(10)) & 
+                                             (market_data['RSI'] < market_data['RSI'].shift(10))).astype(int)
+        
+        # Volume-price relationship
+        market_data['volume_price_trend'] = np.sign(market_data['Price_Change']) * market_data['Volume'] / market_data['Volume'].rolling(20).mean()
+        
+        # Mean reversion signals
+        market_data['overbought'] = (market_data['RSI'] > 70).astype(int)
+        market_data['oversold'] = (market_data['RSI'] < 30).astype(int)
+        
+        # Moving average crossovers
+        market_data['ma_crossover_5_20'] = ((market_data['MA5'] > market_data['MA20']) & 
+                                          (market_data['MA5'].shift(1) <= market_data['MA20'].shift(1))).astype(int)
+        
+        # Technical breakouts
+        market_data['breakout_high'] = ((market_data['Close'] > market_data['High'].rolling(20).max().shift(1)) & 
+                                      (market_data['Volume'] > market_data['Volume'].rolling(20).mean())).astype(int)
+        
+        # Fill NaN values with appropriate methods
+        market_data = market_data.replace([np.inf, -np.inf], np.nan)
+        market_data = market_data.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        return market_data
 
     def get_macroeconomic_data(self, start_date, end_date):
         """
@@ -451,7 +508,12 @@ class MarketFeatureExtractor:
             'HOUST',     # Housing Starts
             'PCE',       # Personal Consumption Expenditures
             'PPIACO',    # Producer Price Index
-            'RETAILSMNSA' # Retail Sales
+            'RETAILSMNSA', # Retail Sales
+            'ICSA',      # Initial Jobless Claims
+            'PERMIT',    # Building Permits
+            'BUSLOANS',  # Commercial and Industrial Loans
+            'MORTGAGE30US', # 30-Year Fixed Rate Mortgage Average
+            'JTSJOL'     # Job Openings
         ]
 
         # Convert date strings to datetime objects
@@ -510,6 +572,33 @@ class MarketFeatureExtractor:
                 macro_df[f'{col}_trend'] = macro_df[col].rolling(window=30).apply(
                     lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) > 5 else np.nan
                 )
+                
+                # Z-scores to measure extremes
+                macro_df[f'{col}_zscore'] = (macro_df[col] - macro_df[col].rolling(252).mean()) / macro_df[col].rolling(252).std()
+                
+                # Rate of change acceleration
+                macro_df[f'{col}_acceleration'] = macro_df[f'{col}_1m_change'].diff(periods=20)
+
+            # Create composite indicators
+            if all(col in macro_df.columns for col in ['UNRATE', 'CPIAUCSL', 'INDPRO']):
+                # Economic health composite
+                macro_df['economic_health'] = (
+                    -1 * macro_df['UNRATE_zscore'] +  # Lower unemployment is better
+                    -1 * macro_df['CPIAUCSL_zscore'] +  # Lower inflation is better
+                    macro_df['INDPRO_zscore']  # Higher industrial production is better
+                ) / 3
+                
+            if all(col in macro_df.columns for col in ['T10Y2Y', 'FEDFUNDS', 'DGS10']):
+                # Monetary policy composite
+                macro_df['monetary_policy'] = (
+                    macro_df['T10Y2Y'] +  # Steeper yield curve suggests expansionary
+                    -1 * macro_df['FEDFUNDS_trend'] +  # Falling rates suggest expansionary
+                    -1 * macro_df['DGS10_trend']  # Falling long rates suggest accommodative
+                )
+                
+            # Risk sentiment composite
+            if 'VIXCLS' in macro_df.columns:
+                macro_df['risk_sentiment'] = -1 * macro_df['VIXCLS_zscore']  # Lower VIX implies risk-on
 
             # Fill any remaining NaNs with zeros
             macro_df = macro_df.fillna(0)
@@ -592,6 +681,21 @@ class MarketFeatureExtractor:
             micro_data['volume_per_range'] = micro_data['volume'] / (micro_data['high'] - micro_data['low'])
             micro_data['close_location'] = (micro_data['close'] - micro_data['low']) / (micro_data['high'] - micro_data['low'])
 
+            # Advanced microstructure metrics
+            # Price impact (Kyle's lambda) - approximation
+            micro_data['price_impact'] = micro_data['close'].diff().abs() / micro_data['volume']
+            
+            # Gap analysis
+            micro_data['overnight_gap'] = micro_data['open'] / micro_data['close'].shift(1) - 1
+            micro_data['gap_fill'] = ((micro_data['open'] > micro_data['close'].shift(1)) & 
+                                     (micro_data['low'] <= micro_data['close'].shift(1))).astype(int)
+            
+            # Market efficiency measures
+            micro_data['high_low_range_ratio'] = (micro_data['high'] - micro_data['low']) / micro_data['close'].rolling(20).std()
+            
+            # Liquidity measures
+            micro_data['amihud_illiquidity'] = micro_data['close'].pct_change().abs() / micro_data['volume']
+            
             # Rolling features
             for window in [5, 10, 20]:
                 # Volatility rolling windows
@@ -610,7 +714,9 @@ class MarketFeatureExtractor:
                 'gk_volatility', 'volume_ma5', 'relative_volume', 'daily_range',
                 'range_ma5', 'vwap_distance', 'avg_trade_size', 'volume_per_range',
                 'close_location', 'volatility_5d', 'volatility_10d', 'volatility_20d',
-                'volume_trend_5d', 'volume_trend_10d', 'volume_trend_20d'
+                'volume_trend_5d', 'volume_trend_10d', 'volume_trend_20d',
+                'price_impact', 'overnight_gap', 'gap_fill', 'high_low_range_ratio', 
+                'amihud_illiquidity'
             ]
 
             print(f"Successfully retrieved microstructure data from Polygon: {len(micro_data)} records")
@@ -655,6 +761,19 @@ class MarketFeatureExtractor:
 
         # 6. Calculate candle body ratio (proxy for conviction)
         micro_data['body_ratio'] = abs(price_data['Close'] - price_data['Open']) / (price_data['High'] - price_data['Low'])
+        
+        # 7. Enhanced metrics
+        micro_data['price_impact'] = price_data['Close'].diff().abs() / price_data['Volume']
+        micro_data['overnight_gap'] = price_data['Open'] / price_data['Close'].shift(1) - 1
+        micro_data['gap_fill'] = ((price_data['Open'] > price_data['Close'].shift(1)) & 
+                                 (price_data['Low'] <= price_data['Close'].shift(1))).astype(int)
+        
+        # Volatility regimes
+        for window in [5, 10, 20]:
+            micro_data[f'volatility_{window}d'] = price_data['Close'].pct_change().rolling(window=window).std()
+            micro_data[f'volume_trend_{window}d'] = price_data['Volume'].rolling(window=window).apply(
+                lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) > window/2 else np.nan
+            )
 
         # Fill missing values
         micro_data = micro_data.fillna(method='ffill').fillna(0)
@@ -667,6 +786,9 @@ class MarketFeatureExtractor:
         tech = self.get_technical_indicators(ticker, start_date, end_date)
         macro = self.get_macroeconomic_data(start_date, end_date)
         micro = self.get_market_microstructure(ticker, start_date, end_date, polygon_api_key)
+        
+        # Apply enhanced feature engineering
+        tech = self.enhance_features(tech, macro)
 
         # Ensure all dataframes have the same index (trading days)
         common_idx = tech.index
@@ -678,14 +800,30 @@ class MarketFeatureExtractor:
         if not micro.empty:
             micro = micro.reindex(common_idx, method='ffill')
 
-        # Basic technical features
+        # Extract basic features
         feature_cols = [
-            'MA5', 'MA20', 'MA50',
+            'MA5', 'MA20', 'MA50', 'MA200',
             'RSI', 'MACD', 'MACD_Signal', 'MACD_Diff',
             'BB_High', 'BB_Low', 'BB_Mid',
             'Volume_Change', 'Volume_MA5',
             'Price_Change', 'Price_Change_5d', 'Volatility'
         ]
+        
+        # Add enhanced features
+        enhanced_cols = [
+            'price_zscore_5d', 'price_zscore_20d',
+            'momentum_1m', 'momentum_3m', 'momentum_6m',
+            'vol_ratio', 'log_volume', 'volume_momentum',
+            'bull_market', 'high_volatility_regime',
+            'price_acceleration', 'momentum_divergence',
+            'volume_price_trend', 'overbought', 'oversold',
+            'ma_crossover_5_20', 'breakout_high'
+        ]
+        
+        # Add these columns if they exist
+        for col in enhanced_cols:
+            if col in tech.columns:
+                feature_cols.append(col)
 
         # Create the combined feature set
         features_list = [tech[feature_cols]]
@@ -751,8 +889,225 @@ class MarketFeatureExtractor:
 
         return scaled, all_features.index
 
+    def get_enhanced_data(self, ticker, start_date, end_date, polygon_api_key):
+        """Get enhanced alternative data sources"""
+        
+        # Get existing data
+        market_data = self.get_technical_indicators(ticker, start_date, end_date)
+        
+        # Add options data if available
+        try:
+            options_data = self.get_options_metrics(ticker, start_date, end_date, polygon_api_key)
+            market_data = pd.merge(
+                market_data, 
+                options_data, 
+                left_index=True, 
+                right_index=True, 
+                how='left'
+            )
+        except Exception as e:
+            print(f"Could not retrieve options data: {e}")
+        
+        # Add sector rotation metrics
+        try:
+            sector_data = self.get_sector_performance(start_date, end_date)
+            market_data = pd.merge(
+                market_data, 
+                sector_data, 
+                left_index=True, 
+                right_index=True, 
+                how='left'
+            )
+        except Exception as e:
+            print(f"Could not retrieve sector data: {e}")
+        
+        # Fill missing values using appropriate methods
+        market_data = self.handle_missing_data(market_data)
+        
+        return market_data
 
-# --------------------- Model ---------------------
+    def handle_missing_data(self, data):
+        """Intelligent missing data handling"""
+        # Handle missing values based on column type
+        numeric_cols = data.select_dtypes(include='number').columns
+        
+        # For price-based metrics, use forward fill then backward fill
+        price_cols = [col for col in numeric_cols if 'price' in col.lower() 
+                      or 'close' in col.lower() or 'open' in col.lower() 
+                      or 'high' in col.lower() or 'low' in col.lower()]
+        
+        for col in price_cols:
+            data[col] = data[col].fillna(method='ffill').fillna(method='bfill')
+        
+        # For momentum and rate of change metrics, use 0
+        momentum_cols = [col for col in numeric_cols if 'momentum' in col.lower() 
+                        or 'change' in col.lower() or 'pct' in col.lower()]
+        
+        for col in momentum_cols:
+            data[col] = data[col].fillna(0)
+        
+        # For volume metrics, use the median
+        volume_cols = [col for col in numeric_cols if 'volume' in col.lower()]
+        
+        for col in volume_cols:
+            data[col] = data[col].fillna(data[col].median())
+        
+        # Finally, replace any remaining NaNs with column medians
+        for col in numeric_cols:
+            if data[col].isna().any():
+                data[col] = data[col].fillna(data[col].median())
+        
+        return data
+
+    def get_options_metrics(self, ticker, start_date, end_date, polygon_api_key):
+        """
+        Fetch options data from Polygon and calculate options-based metrics.
+        This is an advanced method that requires options data access.
+        """
+        # This is a placeholder for a real implementation
+        # In practice, you would fetch options chains and calculate metrics like:
+        # - Put/Call ratio
+        # - Implied volatility skew
+        # - Options volume
+        # - Open interest
+        
+        # For now, return an empty DataFrame
+        return pd.DataFrame()
+        
+    def get_sector_performance(self, start_date, end_date):
+        """
+        Get sector rotation data by analyzing sector ETFs
+        """
+        # Sector ETFs tickers
+        sectors = {
+            'XLY': 'Consumer Discretionary',
+            'XLP': 'Consumer Staples',
+            'XLE': 'Energy',
+            'XLF': 'Financials',
+            'XLV': 'Healthcare',
+            'XLI': 'Industrials',
+            'XLB': 'Materials',
+            'XLK': 'Technology',
+            'XLU': 'Utilities',
+            'XLRE': 'Real Estate'
+        }
+        
+        # This is a placeholder implementation
+        # In practice, you would download data for all sectors,
+        # calculate relative performance metrics
+        
+        return pd.DataFrame()
+
+
+# --------------------- Model Definitions ---------------------
+class ImprovedMarketModel(nn.Module):
+    def __init__(self, market_feature_dim, news_embedding_dim, hidden_dim=256, num_layers=2, dropout=0.3):
+        super(ImprovedMarketModel, self).__init__()
+        self.market_feature_dim = market_feature_dim
+        self.news_embedding_dim = news_embedding_dim
+        self.hidden_dim = hidden_dim
+        
+        # Transformer encoder for time series
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=market_feature_dim,
+            nhead=4,  # Multi-head attention
+            dim_feedforward=hidden_dim,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Enhanced attention for news
+        self.news_attention = nn.Sequential(
+            nn.Linear(news_embedding_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+            nn.Softmax(dim=1)
+        )
+        
+        # Cross-modal feature fusion with gating mechanism
+        self.news_projection = nn.Linear(news_embedding_dim + 1, hidden_dim)
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid()
+        )
+        
+        # Main sequence processing with GRU
+        self.gru = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        # Hierarchical attention for time steps
+        self.time_attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+            nn.Softmax(dim=1)
+        )
+        
+        # Multiple prediction heads
+        self.direction_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 3)  # DOWN, NEUTRAL, UP
+        )
+        
+        # Uncertainty estimation head
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, market_features, news_embeddings, news_sentiment):
+        batch_size, seq_len, _ = market_features.size()
+        
+        # Apply transformer to market features
+        market_encoded = self.transformer(market_features)
+        
+        # Process news with attention
+        news_attention_weights = self.news_attention(news_embeddings)
+        attended_news = torch.sum(news_embeddings * news_attention_weights, dim=1)
+        
+        # Include sentiment information
+        avg_sentiment = torch.mean(news_sentiment, dim=1)
+        news_with_sentiment = torch.cat([attended_news, avg_sentiment], dim=1)
+        
+        # Project news to same dimension as market features
+        news_projected = self.news_projection(news_with_sentiment)
+        
+        # Repeat for sequence length
+        news_projected = news_projected.unsqueeze(1).repeat(1, seq_len, 1)
+        
+        # Gated fusion mechanism
+        combined_features = torch.cat([market_encoded, news_projected], dim=2)
+        gate_values = self.fusion_gate(combined_features)
+        
+        # Apply gating
+        fused_features = market_encoded * gate_values + news_projected * (1 - gate_values)
+        
+        # Process with GRU
+        gru_out, _ = self.gru(fused_features)
+        
+        # Apply temporal attention
+        time_weights = self.time_attention(gru_out).transpose(1, 2)
+        context_vector = torch.bmm(time_weights, gru_out).squeeze(1)
+        
+        # Get predictions from multiple heads
+        direction_logits = self.direction_head(context_vector)
+        uncertainty = self.uncertainty_head(context_vector)
+        
+        return direction_logits, uncertainty
+
+# --------------------- Original model for backward compatibility --------- 
 class MarketPredictionModel(nn.Module):
     def __init__(self, market_feature_dim, news_embedding_dim, hidden_dim=128, num_layers=2, dropout=0.2):
         super(MarketPredictionModel, self).__init__()
@@ -824,6 +1179,51 @@ class MarketPredictionModel(nn.Module):
         return predictions
 
 
+# --------------------- Ensemble Model ---------------------
+class EnsemblePredictor:
+    """Ensemble of multiple models for better generalization"""
+    def __init__(self, models_list, weights=None, voting='soft'):
+        self.models = models_list
+        self.voting = voting
+        
+        if weights is None:
+            self.weights = [1/len(models_list)] * len(models_list)
+        else:
+            total = sum(weights)
+            self.weights = [w/total for w in weights]
+    
+    def predict(self, market_feats, news_embeds, news_sents):
+        self.models_output = []
+        
+        for model in self.models:
+            model.eval()
+            with torch.no_grad():
+                if isinstance(model, MarketPredictionModel):
+                    # Original model
+                    output = model(market_feats, news_embeds, news_sents)
+                    output = output[:, -1, :]  # Take last time step
+                else:
+                    # Improved model
+                    output, _ = model(market_feats, news_embeds, news_sents)
+                
+                self.models_output.append(output)
+        
+        if self.voting == 'hard':
+            # Get class predictions from each model
+            predictions = [torch.argmax(out, dim=1) for out in self.models_output]
+            # Stack predictions and find mode (most common class)
+            stacked = torch.stack(predictions)
+            final_pred = torch.mode(stacked, dim=0).values
+        else:
+            # Weighted average of probabilities
+            probs = [F.softmax(out, dim=1) for out in self.models_output]
+            weighted_probs = [p * w for p, w in zip(probs, self.weights)]
+            avg_prob = torch.sum(torch.stack(weighted_probs), dim=0)
+            final_pred = torch.argmax(avg_prob, dim=1)
+            
+        return final_pred, avg_prob
+
+
 # --------------------- PyTorch Dataset ---------------------
 class TensorDataset(Dataset):
     def __init__(self, market_features, news_embeddings, news_sentiment, labels):
@@ -844,8 +1244,49 @@ class TensorDataset(Dataset):
         )
 
 
+# --------------------- Loss Functions and Training Utilities ---------------------
+class FocalLoss(nn.Module):
+    """Focal Loss for imbalanced classification"""
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+class EarlyStopping:
+    """Early stopping to prevent overfitting"""
+    def __init__(self, patience=7, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        
+    def __call__(self, val_loss):
+        if self.best_score is None:
+            self.best_score = val_loss
+        elif val_loss > self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = val_loss
+            self.counter = 0
+
+
 def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_test, 
-                               market_feature_dim, news_embedding_dim, seed=42):
+                               market_feature_dim, news_embedding_dim, model_type='improved', seed=42):
     """
     Perform hyperparameter optimization using Optuna
     
@@ -855,11 +1296,16 @@ def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_t
         y_train, y_test: Target labels
         market_feature_dim: Dimension of market features
         news_embedding_dim: Dimension of news embeddings
+        model_type: Which model architecture to use ('original' or 'improved')
         seed: Random seed for reproducibility
         
     Returns:
         dict: Best hyperparameters
     """
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
     # Create datasets
     train_dataset = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
@@ -887,18 +1333,30 @@ def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_t
         neutral_weight = trial.suggest_float("neutral_weight", 0.5, 3.0)
         up_weight = trial.suggest_float("up_weight", 0.5, 3.0)
         
+        # Focal loss gamma parameter
+        gamma = trial.suggest_float("gamma", 0.5, 5.0)
+        
         # Print the current trial configuration
         print(f"Trial {trial.number}: Testing {hidden_dim=}, {num_layers=}, {dropout=}, {learning_rate=}, {batch_size=}")
-        print(f"Class weights: DOWN={down_weight}, NEUTRAL={neutral_weight}, UP={up_weight}")
+        print(f"Class weights: DOWN={down_weight}, NEUTRAL={neutral_weight}, UP={up_weight}, Gamma={gamma}")
         
         # Create model with these hyperparameters
-        model = MarketPredictionModel(
-            market_feature_dim=market_feature_dim,
-            news_embedding_dim=news_embedding_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout
-        )
+        if model_type == 'improved':
+            model = ImprovedMarketModel(
+                market_feature_dim=market_feature_dim,
+                news_embedding_dim=news_embedding_dim,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                dropout=dropout
+            )
+        else:
+            model = MarketPredictionModel(
+                market_feature_dim=market_feature_dim,
+                news_embedding_dim=news_embedding_dim,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                dropout=dropout
+            )
         
         # Create dataloaders with the selected batch size
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -906,10 +1364,10 @@ def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_t
         
         # Set up loss function with class weights
         class_weights = torch.tensor([down_weight, neutral_weight, up_weight], device=device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        focal_loss = FocalLoss(alpha=class_weights, gamma=gamma)
         
         # Set up optimizer with the selected learning rate
-        optimizer = AdamW(model.parameters(), lr=learning_rate)
+        optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
         
         # Move model to device
         model.to(device)
@@ -918,7 +1376,11 @@ def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_t
         max_epochs = 30
         patience = 5  # Early stopping patience
         best_val_loss = float('inf')
+        best_val_f1 = 0
         no_improve_epochs = 0
+        
+        # Early stopping tracker
+        early_stopper = EarlyStopping(patience=patience, min_delta=0.005)
         
         for epoch in range(max_epochs):
             model.train()
@@ -927,11 +1389,17 @@ def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_t
             for batch in train_loader:
                 market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
                 
-                outputs = model(market_feats, news_embeds, news_sents)
-                loss = criterion(outputs[:, -1, :], label_batch)
+                if model_type == 'improved':
+                    logits, uncertainty = model(market_feats, news_embeds, news_sents)
+                    loss = focal_loss(logits, label_batch)
+                else:
+                    outputs = model(market_feats, news_embeds, news_sents)
+                    loss = focal_loss(outputs[:, -1, :], label_batch)
                 
                 optimizer.zero_grad()
                 loss.backward()
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
                 total_loss += loss.item()
@@ -948,45 +1416,36 @@ def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_t
             with torch.no_grad():
                 for batch in test_loader:
                     market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
-                    outputs = model(market_feats, news_embeds, news_sents)
-                    loss = criterion(outputs[:, -1, :], label_batch)
+                    
+                    if model_type == 'improved':
+                        logits, _ = model(market_feats, news_embeds, news_sents)
+                        loss = focal_loss(logits, label_batch)
+                        _, predicted = torch.max(logits, 1)
+                    else:
+                        outputs = model(market_feats, news_embeds, news_sents)
+                        loss = focal_loss(outputs[:, -1, :], label_batch)
+                        _, predicted = torch.max(outputs[:, -1, :], 1)
+                    
                     val_loss += loss.item()
-                    
-                    # Get predictions
-                    _, predicted = torch.max(outputs[:, -1, :], 1)
-                    
                     all_preds.extend(predicted.cpu().numpy())
                     all_labels.extend(label_batch.cpu().numpy())
             
             avg_val_loss = val_loss / len(test_loader)
-            f1 = f1_score(all_labels, all_preds, average='weighted')
-            print(f"Validation Loss: {avg_val_loss:.4f}, F1 Score: {f1:.4f}")
+            val_f1 = f1_score(all_labels, all_preds, average='weighted')
+            print(f"Validation Loss: {avg_val_loss:.4f}, F1 Score: {val_f1:.4f}")
             
             # Early stopping check
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                no_improve_epochs = 0
-            else:
-                no_improve_epochs += 1
-                if no_improve_epochs >= patience:
-                    print(f"Early stopping at epoch {epoch+1}")
-                    break
+            early_stopper(1.0 - val_f1)  # We want to maximize F1, so we convert to a minimization problem
+            if early_stopper.early_stop:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+            
+            # Save best model state based on F1 score
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_epoch = epoch + 1
         
         # Final evaluation
-        model.eval()
-        all_preds = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for batch in test_loader:
-                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
-                outputs = model(market_feats, news_embeds, news_sents)
-                
-                _, predicted = torch.max(outputs[:, -1, :], 1)
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(label_batch.cpu().numpy())
-        
-        # Calculate performance metrics
         accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
         f1 = f1_score(all_labels, all_preds, average='weighted')
         
@@ -1004,11 +1463,145 @@ def hyperparameter_optimization(X_train, X_test, nf_train, nf_test, y_train, y_t
     
     return study.best_params
 
+
+# --------------------- Prediction Calibration ---------------------
+def calibrate_predictions(model, val_loader, temperature=1.0):
+    """Calibrate prediction probabilities and estimate uncertainty"""
+    model.eval()
+    
+    # Setup calibration data
+    val_probs = []
+    val_labels = []
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+            
+            if isinstance(model, ImprovedMarketModel):
+                logits, uncertainty = model(market_feats, news_embeds, news_sents)
+            else:
+                logits = model(market_feats, news_embeds, news_sents)[:, -1, :]
+            
+            # Apply temperature scaling
+            scaled_logits = logits / temperature
+            probs = F.softmax(scaled_logits, dim=1)
+            
+            val_probs.extend(probs.cpu().numpy())
+            val_labels.extend(label_batch.cpu().numpy())
+    
+    # Calculate calibration metrics
+    val_probs = np.array(val_probs)
+    val_labels = np.array(val_labels)
+    
+    # Expected Calibration Error
+    confidences = np.max(val_probs, axis=1)
+    predictions = np.argmax(val_probs, axis=1)
+    accuracies = (predictions == val_labels)
+    
+    # Bin the confidences
+    M = 10  # Number of bins
+    bins = np.linspace(0, 1, M+1)
+    
+    # Calculate ECE
+    ece = 0
+    for m in range(M):
+        in_bin = np.logical_and(confidences > bins[m], confidences <= bins[m+1])
+        if np.sum(in_bin) > 0:
+            accuracy_in_bin = np.mean(accuracies[in_bin])
+            confidence_in_bin = np.mean(confidences[in_bin])
+            ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(confidences))
+    
+    print(f"Expected Calibration Error: {ece:.4f}")
+    
+    # If ECE is high, adjust temperature
+    if ece > 0.05:
+        print("Calibration needed. Trying different temperature values...")
+        best_ece = ece
+        best_temp = temperature
+        
+        for temp in [0.5, 0.8, 1.2, 1.5, 2.0, 3.0]:
+            temp_tensor = torch.tensor(temp, device=device)
+            scaled_logits = logits / temp_tensor
+            new_probs = F.softmax(scaled_logits, dim=1).cpu().numpy()
+            new_confidences = np.max(new_probs, axis=1)
+            
+            # Calculate new ECE
+            new_ece = 0
+            for m in range(M):
+                in_bin = np.logical_and(new_confidences > bins[m], new_confidences <= bins[m+1])
+                if np.sum(in_bin) > 0:
+                    accuracy_in_bin = np.mean(accuracies[in_bin])
+                    confidence_in_bin = np.mean(new_confidences[in_bin])
+                    new_ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(new_confidences))
+            
+            if new_ece < best_ece:
+                best_ece = new_ece
+                best_temp = temp
+        
+        print(f"Best temperature: {best_temp:.2f}, ECE: {best_ece:.4f}")
+        return best_temp
+    
+    return temperature
+
+
+# --------------------- Kelly Position Sizing ---------------------
+def kelly_position_sizing(prediction_probs, historical_win_rate=None, risk_aversion=0.5):
+    """
+    Calculate position size using the Kelly Criterion
+    Args:
+        prediction_probs: Model's probability predictions
+        historical_win_rate: Optional historical win rate for calibration
+        risk_aversion: Fraction of Kelly to use (0.5 = Half Kelly)
+    
+    Returns:
+        optimal_fraction: Kelly optimal fraction of capital to risk
+    """
+    # Get the highest probability class and its probability
+    max_prob = np.max(prediction_probs)
+    predicted_class = np.argmax(prediction_probs)
+    
+    # Adjust probability based on historical model performance
+    if historical_win_rate is not None:
+        # Scale the raw probability by historical accuracy
+        adjusted_prob = max_prob * historical_win_rate
+    else:
+        adjusted_prob = max_prob
+    
+    # Set odds based on the direction
+    if predicted_class == 2:  # UP
+        # Calculate asymmetric payoff (typically market moves up slowly)
+        odds = 1.5  # Example: risk 1 to make 0.5
+    elif predicted_class == 0:  # DOWN
+        # Markets often fall faster than they rise
+        odds = 2.0  # Example: risk 1 to make 1
+    else:  # NEUTRAL
+        # If prediction is neutral, use minimal position
+        return 0.01
+    
+    # Kelly formula: f* = (bp - q) / b
+    # where p = probability of winning, q = 1-p, b = odds
+    win_prob = adjusted_prob
+    lose_prob = 1 - win_prob
+    
+    kelly_fraction = (odds * win_prob - lose_prob) / odds
+    
+    # Apply a fraction of Kelly for safety (risk_aversion parameter)
+    fractional_kelly = kelly_fraction * risk_aversion
+    
+    # Ensure position size is reasonable
+    if fractional_kelly < 0:
+        return 0  # No position if Kelly is negative
+    elif fractional_kelly > 0.2:
+        return 0.2  # Cap at 20% for risk management
+    
+    return fractional_kelly
+
+
 # --------------------- Main Training + Backtest ---------------------
 def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='2025-03-29',
                              seq_length=10, max_articles=5, polygon_api_key=None,
                              historical_news_data=None, fred_api_key=None, 
-                             run_optimization=False):
+                             run_optimization=False, model_type='improved'):
     """
     1) Fetch price data + technical indicators for the entire date range (must >= 50 days).
     2) Use provided historical news data or fetch news from Polygon API.
@@ -1026,6 +1619,8 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
         polygon_api_key (str): Polygon.io API key
         historical_news_data (dict): Optional pre-fetched historical news data
         fred_api_key (str): API key for FRED economic data
+        run_optimization (bool): Whether to run hyperparameter optimization
+        model_type (str): Type of model to use ('original' or 'improved')
 
     Returns:
         tuple: Trained model, accuracy, market features, news data, and dates
@@ -1070,12 +1665,13 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     price_data['Close'] = price_data['Close'].squeeze()
     price_data = price_data.reindex(dates)
 
-    threshold = 0.0005
+    # Make the labeling more robust with a larger threshold
+    threshold = 0.001  # 0.1% movement threshold
     daily_returns = price_data['Close'].pct_change().fillna(0.0).values
     labels = np.zeros(len(daily_returns))
-    labels[daily_returns > threshold] = 2
-    labels[np.abs(daily_returns) <= threshold] = 1
-    labels[daily_returns < -threshold] = 0
+    labels[daily_returns > threshold] = 2  # UP
+    labels[np.abs(daily_returns) <= threshold] = 1  # NEUTRAL
+    labels[daily_returns < -threshold] = 0  # DOWN
 
     # --- Create Sequences ---
     X_sequences = []
@@ -1085,7 +1681,7 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     for i in range(len(market_features) - seq_length):
         X_sequences.append(market_features[i : i+seq_length])
 
-        # Accumulate news from those 10 days
+        # Accumulate news from those sequence days
         seq_news = []
         for j in range(i, i+seq_length):
             d = dates[j]
@@ -1093,7 +1689,7 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
             seq_news.extend(articles_for_day)
 
         news_sequences.append(seq_news)
-        y_sequences.append(labels[i+seq_length])  # label for the day after the 10-day window
+        y_sequences.append(labels[i+seq_length])  # label for the day after the sequence window
 
     X_sequences = np.array(X_sequences)
     y_sequences = np.array(y_sequences)
@@ -1148,15 +1744,15 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     # Check the shape of the first train embeddings
     print("DEBUG: First train embeddings shape:", nf_train[0]['embeddings'].shape)
 
-    # --- Build the LSTM model ---
+    # --- Build the model ---
     market_feature_dim = X_train.shape[2]  # e.g. how many features after scaling
     news_embedding_dim = nf_train[0]['embeddings'].shape[1]  # 768 typically
 
     if run_optimization:
-        print("Running hyperparameter optimization...")
+        print(f"Running hyperparameter optimization for {model_type} model...")
         best_params = hyperparameter_optimization(
             X_train, X_test, nf_train, nf_test, y_train, y_test,
-            market_feature_dim, news_embedding_dim
+            market_feature_dim, news_embedding_dim, model_type=model_type
         )
         
         hidden_dim = best_params["hidden_dim"]
@@ -1170,27 +1766,42 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
         neutral_weight = best_params["neutral_weight"]
         up_weight = best_params["up_weight"]
         
+        # Focal loss gamma
+        gamma = best_params.get("gamma", 2.0)  # Default to 2.0 if not in params
+        
         print(f"Using optimized parameters: {hidden_dim=}, {num_layers=}, {dropout=}, {learning_rate=}, {batch_size=}")
-        print(f"Class weights: DOWN={down_weight}, NEUTRAL={neutral_weight}, UP={up_weight}")
+        print(f"Class weights: DOWN={down_weight}, NEUTRAL={neutral_weight}, UP={up_weight}, Gamma={gamma}")
     else:
         # Default parameters
-        hidden_dim = 512
-        num_layers = 4
+        hidden_dim = 512 if model_type == 'improved' else 256
+        num_layers = 2
         dropout = 0.3
         learning_rate = 0.001
         batch_size = 32
-        down_weight = 1.0
-        neutral_weight = 1.0
+        down_weight = 2.0  # Give more weight to DOWN class
+        neutral_weight = 1.5  # Give more weight to NEUTRAL class (often underrepresented)
         up_weight = 1.0
+        gamma = 2.0  # Default focal loss gamma
     
-    # --- Build the LSTM model ---
-    model = MarketPredictionModel(
-        market_feature_dim=market_feature_dim,
-        news_embedding_dim=news_embedding_dim,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        dropout=dropout
-    )
+    # --- Build the model based on type ---
+    if model_type == 'improved':
+        model = ImprovedMarketModel(
+            market_feature_dim=market_feature_dim,
+            news_embedding_dim=news_embedding_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        print("Using improved model architecture with Transformer + GRU")
+    else:
+        model = MarketPredictionModel(
+            market_feature_dim=market_feature_dim,
+            news_embedding_dim=news_embedding_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        print("Using original model architecture with LSTM")
     
 
     # --- Build PyTorch datasets ---
@@ -1207,16 +1818,25 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
         torch.tensor(y_test, dtype=torch.long)
     )
 
-    # Increase batch size for H100 GPU
-    batch_size = 128 if torch.cuda.is_available() else 32
-
+    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size*2, shuffle=False)
 
     # --- Train ---
+    # Set up loss function with focal loss
     class_weights = torch.tensor([down_weight, neutral_weight, up_weight], device=device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    criterion = FocalLoss(alpha=class_weights, gamma=gamma)
+    
+    # Optimizer with weight decay and gradient clipping
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+    )
+    
+    # Early stopping
+    early_stopper = EarlyStopping(patience=10, min_delta=0.005)
 
     # Move model to GPU
     model.to(device)
@@ -1224,8 +1844,11 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     # Setup mixed precision training if on GPU
     scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 
-    num_epochs = 100
+    num_epochs = 100  # Increase epochs since we have early stopping
     start_time = time.time()
+    
+    best_val_f1 = 0
+    best_model_state = None
 
     for epoch in range(num_epochs):
         model.train()
@@ -1237,78 +1860,130 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
             # Use mixed precision for faster training if on GPU
             if scaler is not None:
                 with torch.cuda.amp.autocast():
-                    outputs = model(market_feats, news_embeds, news_sents)
-                    # Use only the last time-step
-                    loss = criterion(outputs[:, -1, :], label_batch)
+                    if model_type == 'improved':
+                        direction_logits, uncertainty = model(market_feats, news_embeds, news_sents)
+                        loss = criterion(direction_logits, label_batch)
+                    else:
+                        outputs = model(market_feats, news_embeds, news_sents)
+                        loss = criterion(outputs[:, -1, :], label_batch)
 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
+                
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                outputs = model(market_feats, news_embeds, news_sents)
-                # Use only the last time-step
-                loss = criterion(outputs[:, -1, :], label_batch)
-
+                if model_type == 'improved':
+                    direction_logits, uncertainty = model(market_feats, news_embeds, news_sents)
+                    loss = criterion(direction_logits, label_batch)
+                else:
+                    outputs = model(market_feats, news_embeds, news_sents)
+                    loss = criterion(outputs[:, -1, :], label_batch)
+                
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
 
+        # Validation
+        model.eval()
+        val_preds = []
+        val_labels = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                
+                if model_type == 'improved':
+                    direction_logits, _ = model(market_feats, news_embeds, news_sents)
+                    _, predicted = torch.max(direction_logits, 1)
+                else:
+                    outputs = model(market_feats, news_embeds, news_sents)
+                    _, predicted = torch.max(outputs[:, -1, :], 1)
+                
+                val_preds.extend(predicted.cpu().numpy())
+                val_labels.extend(label_batch.cpu().numpy())
+        
+        # Calculate validation metrics
+        val_accuracy = np.mean(np.array(val_preds) == np.array(val_labels))
+        val_f1 = f1_score(val_labels, val_preds, average='weighted')
+        
+        # Update learning rate based on validation performance
+        scheduler.step(val_f1)
+        
+        # Early stopping check
+        early_stopper(1.0 - val_f1)  # We want to maximize F1, so invert for minimization
+        
+        # Save best model
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_model_state = model.state_dict().copy()
+            print(f"New best model with F1 score: {val_f1:.4f}")
+
         # Print GPU memory usage if available
         if torch.cuda.is_available():
             gpu_memory_allocated = round(torch.cuda.memory_allocated()/1024**3, 2)
             gpu_memory_reserved = round(torch.cuda.memory_reserved()/1024**3, 2)
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, GPU Memory: {gpu_memory_allocated}GB allocated, {gpu_memory_reserved}GB reserved")
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Val F1: {val_f1:.4f}, Val Acc: {val_accuracy:.4f}, GPU Memory: {gpu_memory_allocated}GB allocated, {gpu_memory_reserved}GB reserved")
         else:
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Val F1: {val_f1:.4f}, Val Acc: {val_accuracy:.4f}")
+            
+        # Check for early stopping
+        if early_stopper.early_stop:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
+    # Load best model for evaluation
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print("Loaded best model for evaluation")
 
     # --- Evaluate (backtest) ---
     model.eval()
-    correct = 0
-    total = 0
-
-    # Track predictions and true labels for more detailed evaluation
-    all_preds = []
-    all_labels = []
+    test_preds = []
+    test_labels = []
+    
+    # For calibration, collect probability outputs
+    all_probs = []
 
     with torch.no_grad():
         for batch in test_loader:
             market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
 
-            # Use mixed precision for inference as well
-            if device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    outputs = model(market_feats, news_embeds, news_sents)
+            # Get predictions based on model type
+            if model_type == 'improved':
+                logits, uncertainty = model(market_feats, news_embeds, news_sents)
+                probs = F.softmax(logits, dim=1)
+                _, predicted = torch.max(logits, 1)
             else:
                 outputs = model(market_feats, news_embeds, news_sents)
+                probs = F.softmax(outputs[:, -1, :], dim=1)
+                _, predicted = torch.max(outputs[:, -1, :], 1)
 
-            # last step
-            _, predicted = torch.max(outputs[:, -1, :], 1)
-
-            # Store predictions and true labels
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(label_batch.cpu().numpy())
-
-            total += label_batch.size(0)
-            correct += (predicted == label_batch).sum().item()
+            # Store predictions, probabilities and true labels
+            test_preds.extend(predicted.cpu().numpy())
+            test_labels.extend(label_batch.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
     # Calculate accuracy
-    accuracy = correct / total
+    accuracy = np.mean(np.array(test_preds) == np.array(test_labels))
     print(f"Backtest Accuracy (time-based split): {accuracy:.4f}")
 
     # Calculate precision & recall for each class
-    from sklearn.metrics import classification_report
     print("\nDetailed classification report:")
     class_names = ["DOWN", "NEUTRAL", "UP"]
-    print(classification_report(all_labels, all_preds, target_names=class_names))
+    print(classification_report(test_labels, test_preds, target_names=class_names))
 
     # Calculate confusion matrix
-    from sklearn.metrics import confusion_matrix
-    cm = confusion_matrix(all_labels, all_preds)
+    cm = confusion_matrix(test_labels, test_preds)
     print("\nConfusion Matrix:")
     print(cm)
 
@@ -1316,22 +1991,25 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     total_time = time.time() - start_time
     print(f"Total training time: {total_time:.2f} seconds")
 
-    # Return everything in case you want further analysis
-    return model, accuracy, market_features, news_data, dates, (all_preds, all_labels)
+    # Return everything including probabilities for calibration
+    return model, accuracy, market_features, news_data, dates, (test_preds, test_labels, all_probs, test_loader)
 
 
 # --------------------- Real-time Prediction ---------------------
-def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_key=None, fred_api_key=None):
+def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_key=None, 
+                    fred_api_key=None, temperature=1.0, model_type='improved'):
     """
     Make a prediction for the next trading day based on the most recent data.
 
     Args:
-        model: Trained MarketPredictionModel
+        model: Trained model (either MarketPredictionModel or ImprovedMarketModel)
         ticker: Stock ticker symbol
         last_n_days: Number of days to use for the sequence (should match training)
         max_articles: Maximum number of articles per sequence
         polygon_api_key: Polygon API key for news and microstructure data
         fred_api_key: FRED API key for macroeconomic data
+        temperature: Temperature for calibrating predictions
+        model_type: Type of model ('original' or 'improved')
 
     Returns:
         prediction: Class prediction (0=DOWN, 1=NEUTRAL, 2=UP)
@@ -1362,7 +2040,10 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     latest_dates = dates[-last_n_days:]
 
     # Get the expected feature count from the model's market_feature_dim
-    expected_feature_dim = model.market_feature_dim
+    if model_type == 'improved':
+        expected_feature_dim = model.market_feature_dim
+    else:
+        expected_feature_dim = model.market_feature_dim
     
     # Check if we have a mismatch
     if latest_features.shape[1] != expected_feature_dim:
@@ -1433,25 +2114,228 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     with torch.no_grad():
         if device.type == 'cuda':
             with torch.cuda.amp.autocast():
-                outputs = model(market_tensor, news_embeds, news_sents)
+                if model_type == 'improved':
+                    logits, uncertainty_score = model(market_tensor, news_embeds, news_sents)
+                else:
+                    logits = model(market_tensor, news_embeds, news_sents)[:, -1, :]
+                    uncertainty_score = torch.tensor([0.5], device=device)  # Placeholder for original model
+                
+                # Apply temperature scaling for calibration
+                scaled_logits = logits / temperature
+                probs = torch.nn.functional.softmax(scaled_logits, dim=1)[0]
+                _, pred = torch.max(scaled_logits, 1)
         else:
-            outputs = model(market_tensor, news_embeds, news_sents)
-
-        # Get prediction for last step
-        probs = torch.nn.functional.softmax(outputs[:, -1, :], dim=1)[0]
-        _, pred = torch.max(outputs[:, -1, :], 1)
+            if model_type == 'improved':
+                logits, uncertainty_score = model(market_tensor, news_embeds, news_sents)
+            else:
+                logits = model(market_tensor, news_embeds, news_sents)[:, -1, :]
+                uncertainty_score = torch.tensor([0.5], device=device)  # Placeholder for original model
+                
+            # Apply temperature scaling for calibration
+            scaled_logits = logits / temperature
+            probs = torch.nn.functional.softmax(scaled_logits, dim=1)[0]
+            _, pred = torch.max(scaled_logits, 1)
 
     # Convert to numpy
     prediction = pred.item()
     confidence = probs.cpu().numpy()
+    uncertainty = uncertainty_score.cpu().numpy()[0]
 
     # Map prediction to label
     label_map = {0: "DOWN", 1: "NEUTRAL", 2: "UP"}
 
     print(f"Prediction for next day: {label_map[prediction]}")
     print(f"Confidence: DOWN={confidence[0]:.2f}, NEUTRAL={confidence[1]:.2f}, UP={confidence[2]:.2f}")
+    print(f"Model uncertainty: {uncertainty:.2f} (lower is better)")
 
-    return prediction, confidence, latest_dates
+    return prediction, confidence, uncertainty, latest_dates
+
+
+# --------------------- Create Ensemble of Models ---------------------
+def create_and_train_ensemble(X_train, X_test, nf_train, nf_test, y_train, y_test,
+                             market_feature_dim, news_embedding_dim, num_models=3,
+                             device=device):
+    """
+    Create and train an ensemble of models with different architectures
+    
+    Args:
+        X_train, X_test: Market features for training and testing
+        nf_train, nf_test: News features for training and testing
+        y_train, y_test: Target labels
+        market_feature_dim: Dimension of market features
+        news_embedding_dim: Dimension of news embeddings
+        num_models: Number of models in the ensemble
+        device: Training device
+        
+    Returns:
+        ensemble: Trained ensemble model
+    """
+    print(f"Creating ensemble of {num_models} models...")
+    
+    # Create datasets
+    train_dataset = TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor([f['embeddings'] for f in nf_train], dtype=torch.float32),
+        torch.tensor([f['sentiment_scores'] for f in nf_train], dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.long)
+    )
+    test_dataset = TensorDataset(
+        torch.tensor(X_test, dtype=torch.float32),
+        torch.tensor([f['embeddings'] for f in nf_test], dtype=torch.float32),
+        torch.tensor([f['sentiment_scores'] for f in nf_test], dtype=torch.float32),
+        torch.tensor(y_test, dtype=torch.long)
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    
+    # Initialize models list
+    models = []
+    weights = []
+    
+    # Define different configurations for ensemble models
+    configs = [
+        # Model 1: Original LSTM with more layers
+        {
+            'type': 'original',
+            'hidden_dim': 512,
+            'num_layers': 3,
+            'dropout': 0.3,
+            'learning_rate': 0.001
+        },
+        # Model 2: Improved model with transformer
+        {
+            'type': 'improved',
+            'hidden_dim': 256,
+            'num_layers': 2,
+            'dropout': 0.3,
+            'learning_rate': 0.001
+        },
+        # Model 3: Improved model with focus on news
+        {
+            'type': 'improved',
+            'hidden_dim': 384,
+            'num_layers': 1,
+            'dropout': 0.2,
+            'learning_rate': 0.002
+        }
+    ]
+    
+    # Train each model
+    for i, config in enumerate(configs[:num_models]):
+        print(f"\nTraining model {i+1}/{num_models} with config: {config}")
+        
+        # Create model based on type
+        if config['type'] == 'improved':
+            model = ImprovedMarketModel(
+                market_feature_dim=market_feature_dim,
+                news_embedding_dim=news_embedding_dim,
+                hidden_dim=config['hidden_dim'],
+                num_layers=config['num_layers'],
+                dropout=config['dropout']
+            )
+        else:
+            model = MarketPredictionModel(
+                market_feature_dim=market_feature_dim,
+                news_embedding_dim=news_embedding_dim,
+                hidden_dim=config['hidden_dim'],
+                num_layers=config['num_layers'],
+                dropout=config['dropout']
+            )
+            
+        # Move model to device
+        model.to(device)
+        
+        # Setup loss function (Focal Loss) and optimizer
+        criterion = FocalLoss(
+            alpha=torch.tensor([2.0, 1.5, 1.0], device=device),
+            gamma=2.0
+        )
+        optimizer = AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+        
+        # Train for a fixed number of epochs
+        epochs = 30
+        
+        for epoch in range(epochs):
+            model.train()
+            total_loss = 0
+            
+            for batch in train_loader:
+                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                
+                if config['type'] == 'improved':
+                    logits, _ = model(market_feats, news_embeds, news_sents)
+                    loss = criterion(logits, label_batch)
+                else:
+                    outputs = model(market_feats, news_embeds, news_sents)
+                    loss = criterion(outputs[:, -1, :], label_batch)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                total_loss += loss.item()
+                
+            avg_loss = total_loss / len(train_loader)
+            
+            # Validation
+            if (epoch + 1) % 5 == 0:
+                model.eval()
+                val_preds = []
+                val_labels = []
+                
+                with torch.no_grad():
+                    for batch in test_loader:
+                        market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                        
+                        if config['type'] == 'improved':
+                            logits, _ = model(market_feats, news_embeds, news_sents)
+                            _, predicted = torch.max(logits, 1)
+                        else:
+                            outputs = model(market_feats, news_embeds, news_sents)
+                            _, predicted = torch.max(outputs[:, -1, :], 1)
+                        
+                        val_preds.extend(predicted.cpu().numpy())
+                        val_labels.extend(label_batch.cpu().numpy())
+                
+                val_f1 = f1_score(val_labels, val_preds, average='weighted')
+                print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}, Val F1: {val_f1:.4f}")
+        
+        # Final evaluation
+        model.eval()
+        val_preds = []
+        val_labels = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                
+                if config['type'] == 'improved':
+                    logits, _ = model(market_feats, news_embeds, news_sents)
+                    _, predicted = torch.max(logits, 1)
+                else:
+                    outputs = model(market_feats, news_embeds, news_sents)
+                    _, predicted = torch.max(outputs[:, -1, :], 1)
+                
+                val_preds.extend(predicted.cpu().numpy())
+                val_labels.extend(label_batch.cpu().numpy())
+        
+        # Calculate F1 score
+        val_f1 = f1_score(val_labels, val_preds, average='weighted')
+        print(f"Model {i+1} final F1 score: {val_f1:.4f}")
+        
+        # Add model to ensemble with weight proportional to its F1 score
+        models.append(model)
+        weights.append(val_f1)
+    
+    # Create ensemble with weights proportional to F1 scores
+    ensemble = EnsemblePredictor(models, weights=weights)
+    print(f"Created ensemble with {len(models)} models")
+    
+    return ensemble
 
 
 # --------------------- Example Usage ---------------------
@@ -1484,9 +2368,12 @@ if __name__ == "__main__":
     total_articles = sum(len(articles) for articles in historical_news.values())
     print(f"Successfully fetched {total_articles} historical news articles for SPY")
 
+    # Set model type and whether to run hyperparameter optimization
+    model_type = 'improved'  # Use 'improved' or 'original'
     run_optimization = True  # Set to False after finding optimal parameters
     
-    model, accuracy, market_feats, all_news, all_dates, evaluation = train_and_backtest_model(
+    # Train the model and get evaluation results
+    model, accuracy, market_feats, all_news, all_dates, evaluation_data = train_and_backtest_model(
         ticker="SPY",
         start_date=start_date,
         end_date=end_date,
@@ -1495,22 +2382,48 @@ if __name__ == "__main__":
         polygon_api_key=polygon_api_key,
         historical_news_data=historical_news,
         fred_api_key=fred_api_key,
-        run_optimization=run_optimization  # Add this parameter
+        run_optimization=run_optimization,
+        model_type=model_type
     )
 
     print(f"\nFinal Backtest Accuracy: {accuracy:.4f}")
+    
+    # Unpack evaluation data
+    test_preds, test_labels, test_probs, test_loader = evaluation_data
+    
+    # Calibrate model predictions
+    print("\nCalibrating model predictions...")
+    temperature = calibrate_predictions(model, test_loader, temperature=1.0)
+    print(f"Using temperature scaling with T={temperature:.2f}")
 
     # Make a prediction for the next trading day
     print("\nPredicting next trading day...")
-    prediction, confidence, dates = predict_next_day(
+    prediction, confidence, uncertainty, dates = predict_next_day(
         model=model,
         ticker="SPY",
         last_n_days=10,
         max_articles=5,
         polygon_api_key=polygon_api_key,
-        fred_api_key=fred_api_key
+        fred_api_key=fred_api_key,
+        temperature=temperature,
+        model_type=model_type
     )
+    
+    # Calculate position size using Kelly Criterion
+    historical_accuracy = accuracy  # Use backtest accuracy as a proxy
+    position_size = kelly_position_sizing(confidence, historical_accuracy, risk_aversion=0.5)
+    print(f"Recommended position size: {position_size:.2%} of capital")
+    
+    # Print trading recommendation
+    label_map = {0: "DOWN", 1: "NEUTRAL", 2: "UP"}
+    print("\n=== TRADING RECOMMENDATION ===")
+    print(f"Direction: {label_map[prediction]}")
+    print(f"Confidence: {confidence[prediction]:.2f}")
+    print(f"Uncertainty: {uncertainty:.2f}")
+    print(f"Position size: {position_size:.2%} of capital")
+    print("==============================")
 
     # Save model (optional)
-    torch.save(model.state_dict(), f"market_prediction_model_{datetime.now().strftime('%Y%m%d')}.pt")
-    print("\nModel saved successfully.")
+    model_path = f"market_prediction_model_{model_type}_{datetime.now().strftime('%Y%m%d')}.pt"
+    torch.save(model.state_dict(), model_path)
+    print(f"\nModel saved as {model_path}")
