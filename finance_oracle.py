@@ -1585,10 +1585,14 @@ def calibrate_predictions(model, val_loader, temperature=1.0):
     for m in range(M):
         in_bin = np.logical_and(confidences > bins[m], confidences <= bins[m+1])
         if np.sum(in_bin) > 0:
-            accuracy_in_bin = np.mean(accuracies[in_bin])
-            confidence_in_bin = np.mean(confidences[in_bin])
-            ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(confidences))
-    
+            # Make sure arrays have the same length before indexing
+            if len(in_bin) == len(accuracies):
+                accuracy_in_bin = np.mean(accuracies[in_bin])
+                confidence_in_bin = np.mean(confidences[in_bin])
+                ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(confidences))
+            else:
+                print(f"Warning: Size mismatch in bin {m}. Skipping this bin.")
+                print(f"in_bin length: {len(in_bin)}, accuracies length: {len(accuracies)}")
     print(f"Expected Calibration Error: {ece:.4f}")
     
     # If ECE is high, adjust temperature
