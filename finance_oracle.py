@@ -906,7 +906,7 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     price_data['Close'] = price_data['Close'].squeeze()
     price_data = price_data.reindex(dates)
 
-    threshold = 0.003
+    threshold = 0.0005
     daily_returns = price_data['Close'].pct_change().fillna(0.0).values
     labels = np.zeros(len(daily_returns))
     labels[daily_returns > threshold] = 2
@@ -993,7 +993,7 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
         news_embedding_dim=news_embedding_dim,
         hidden_dim=512,  
         num_layers=4,    
-        dropout=0.3
+        dropout=0.5
     )
 
     # --- Build PyTorch datasets ---
@@ -1017,7 +1017,8 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     test_loader  = DataLoader(test_dataset, batch_size=batch_size*2, shuffle=False)
 
     # --- Train ---
-    criterion = nn.CrossEntropyLoss()
+    class_weights = torch.tensor([1.5, 2.0, 1.0], device=device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = AdamW(model.parameters(), lr=0.001)
 
     # Move model to GPU
