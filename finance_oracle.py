@@ -1144,7 +1144,7 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
 
     # Calculate date range for the last n days
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=last_n_days*2)  # Get extra days for indicators
+    start_date = end_date - timedelta(days=100)  # Get 100 days for indicators
 
     # Format dates for API
     start_date_str = start_date.strftime('%Y-%m-%d')
