@@ -1564,7 +1564,7 @@ def calibrate_predictions(model, val_loader, temperature=1.0):
             scaled_logits = logits / temperature
             probs = F.softmax(scaled_logits, dim=1)
             
-            val_probs.extend(probs.cpu().numpy())
+            val_probs.extend(probs.detach().cpu().numpy())
             val_labels.extend(label_batch.cpu().numpy())
     
     # Calculate calibration metrics
@@ -1614,33 +1614,41 @@ def calibrate_predictions(model, val_loader, temperature=1.0):
         best_temp = temperature
         
         for temp in [0.5, 0.8, 1.2, 1.5, 2.0, 3.0]:
-            # Calculate new calibration with this temperature
             new_ece = 0
-            for batch in val_loader:
-                market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
-                
-                if isinstance(model, ImprovedMarketModel):
-                    logits, _ = model(market_feats, news_embeds, news_sents)
-                else:
-                    logits = model(market_feats, news_embeds, news_sents)[:, -1, :]
-                
-                # Apply new temperature
-                scaled_logits = logits / temp
-                new_probs = F.softmax(scaled_logits, dim=1).cpu().numpy()
-                
-                # Track metrics for this batch
-                batch_confidences = np.max(new_probs, axis=1)
-                batch_predictions = np.argmax(new_probs, axis=1)
-                batch_accuracies = (batch_predictions == label_batch.cpu().numpy())
-                
-                # Calculate ECE contribution from this batch
-                for m in range(M):
-                    in_bin = np.logical_and(batch_confidences > bins[m], batch_confidences <= bins[m+1])
-                    if np.sum(in_bin) > 0:
-                        accuracy_in_bin = np.mean(batch_accuracies[in_bin])
-                        confidence_in_bin = np.mean(batch_confidences[in_bin])
-                        new_ece += np.abs(accuracy_in_bin - confidence_in_bin) * (np.sum(in_bin) / len(batch_confidences))
+            temp_probs = []
             
+            with torch.no_grad():  # Added this to ensure no gradients
+                for batch in val_loader:
+                    market_feats, news_embeds, news_sents, label_batch = [b.to(device) for b in batch]
+                    
+                    if isinstance(model, ImprovedMarketModel):
+                        logits, _ = model(market_feats, news_embeds, news_sents)
+                    else:
+                        logits = model(market_feats, news_embeds, news_sents)[:, -1, :]
+                    
+                    # Apply new temperature
+                    scaled_logits = logits / temp
+                    batch_probs = F.softmax(scaled_logits, dim=1).detach().cpu().numpy()
+                    temp_probs.extend(batch_probs)
+            
+            temp_probs = np.array(temp_probs)
+            temp_confidences = np.max(temp_probs, axis=1)
+            temp_predictions = np.argmax(temp_probs, axis=1)
+            temp_accuracies = (temp_predictions == val_labels)
+            
+            # Calculate ECE for this temperature
+            for m in range(M):
+                in_bin_indices = []
+                for i in range(len(temp_confidences)):
+                    if temp_confidences[i] > bins[m] and temp_confidences[i] <= bins[m+1]:
+                        in_bin_indices.append(i)
+                
+                if len(in_bin_indices) > 0:
+                    accuracy_in_bin = np.mean([temp_accuracies[i] for i in in_bin_indices])
+                    confidence_in_bin = np.mean([temp_confidences[i] for i in in_bin_indices])
+                    new_ece += np.abs(accuracy_in_bin - confidence_in_bin) * (len(in_bin_indices) / len(temp_confidences))
+            
+            print(f"Temperature {temp:.2f}, ECE: {new_ece:.4f}")
             if new_ece < best_ece:
                 best_ece = new_ece
                 best_temp = temp
