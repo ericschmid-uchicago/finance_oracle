@@ -704,7 +704,19 @@ class MarketFeatureExtractor:
         print(f"Combined features shape: {all_features.shape}")
         print(f"Feature columns: {all_features.columns.tolist()}")
 
-        # Scale the features using StandardScaler
+        # Clean up any infinity or extremely large values before scaling
+        all_features = all_features.replace([np.inf, -np.inf], np.nan)
+        all_features = all_features.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        # Additional check for extremely large values
+        for col in all_features.columns:
+            # Replace values larger than a threshold with the column median
+            extreme_mask = np.abs(all_features[col]) > 1e10
+            if extreme_mask.any():
+                print(f"Replacing extreme values in column: {col}")
+                all_features.loc[extreme_mask, col] = all_features[col].median()
+        
+        # Now scale the cleaned data
         scaled = self.scaler.fit_transform(all_features)
 
         return scaled, all_features.index
