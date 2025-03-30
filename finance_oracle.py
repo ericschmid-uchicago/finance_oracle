@@ -1700,8 +1700,8 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     price_data['Close'] = price_data['Close'].squeeze()
     price_data = price_data.reindex(dates)
 
-    # Make the labeling more robust with a larger threshold
-    threshold = 0.001  # 0.1% movement threshold
+    atr = ta.volatility.average_true_range(price_data['High'], price_data['Low'], price_data['Close'], window=14)
+    threshold = 0.5 * atr / price_data['Close']
     daily_returns = price_data['Close'].pct_change().fillna(0.0).values
     labels = np.zeros(len(daily_returns))
     labels[daily_returns > threshold] = 2  # UP
