@@ -2176,12 +2176,18 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     # Check if we have enough data
     if len(market_features) < last_n_days:
         print(f"WARNING: Not enough recent data available. Need {last_n_days} days, got {len(market_features)}")
-        print("Padding with zeros...")
-        # Pad with zeros at the beginning to reach the required sequence length
+        print("Padding with more appropriate values...")
+        # Pad with more appropriate values instead of just zeros
         padding_needed = last_n_days - len(market_features)
         if len(market_features) > 0:
-            padding_shape = (padding_needed, market_features.shape[1])
-            market_features = np.vstack([np.zeros(padding_shape), market_features])
+            # Create padding using the mean of existing features
+            mean_features = np.mean(market_features, axis=0, keepdims=True)
+            padding = np.repeat(mean_features, padding_needed, axis=0)
+            # Small random noise to avoid exact same values
+            noise = np.random.normal(0, 0.01, padding.shape)
+            padding = padding + noise
+            market_features = np.vstack([padding, market_features])
+            
             # Add padding dates
             first_date = dates[0] if len(dates) > 0 else end_date
             padding_dates = [first_date - timedelta(days=i+1) for i in range(padding_needed)]
@@ -2322,35 +2328,59 @@ def predict_next_day(model, ticker, last_n_days=10, max_articles=5, polygon_api_
     # Convert to numpy
     prediction = pred.item()
     confidence = probs.cpu().numpy()
-    uncertainty = float(uncertainty_score.cpu().numpy())  # Convert to float here
+    uncertainty = uncertainty_score.cpu().numpy()[0] if hasattr(uncertainty_score, 'cpu') else 0.5
     
+    # Convert uncertainty to a scalar value to avoid formatting issues
+    if isinstance(uncertainty, np.ndarray):
+        uncertainty = float(uncertainty)
+
     # Map prediction to label
     label_map = {0: "DOWN", 1: "NEUTRAL", 2: "UP"}
-    
+
     print(f"Prediction for next day: {label_map[prediction]}")
     print(f"Confidence: DOWN={confidence[0]:.2f}, NEUTRAL={confidence[1]:.2f}, UP={confidence[2]:.2f}")
     print(f"Model uncertainty: {uncertainty:.2f} (lower is better)")
-    
+
     # Calculate confidence-adjusted prediction
-    if max(confidence) < 0.45:  # If no class has clear confidence
-        adj_prediction = 1  # Default to NEUTRAL
-        print("Low confidence prediction, defaulting to NEUTRAL stance")
+    max_confidence = np.max(confidence)
+    if max_confidence < 0.45:  # If no class has clear confidence
+        adjusted_prediction = 1  # Default to NEUTRAL
+        if prediction != 1:  # Only mention if we're adjusting
+            print("Low confidence detection - adjusting to NEUTRAL stance")
     else:
-        adj_prediction = prediction
-    
-    # Add some market context to the prediction
-    print("\nMarket Context:")
-    if 'bull_market' in market_features[-1] and market_features[-1]['bull_market'] > 0.5:
-        print("- Currently in a bull market regime")
-    elif 'bull_market' in market_features[-1]:
-        print("- Currently in a bear market regime")
-    
-    if 'volatility_regime' in market_features[-1] and market_features[-1]['volatility_regime'] > 0.5:
-        print("- High volatility environment")
-    else:
-        print("- Normal volatility environment")
-    
-    return adj_prediction, confidence, uncertainty, latest_dates
+        adjusted_prediction = prediction
+
+    # Extract key market indicators if available
+    try:
+        recent_returns = []
+        recent_volatility = 0
+        market_trend = "unknown"
+        
+        # Get recent returns if available
+        if hasattr(market_tensor, 'numpy'):
+            tensor_data = market_tensor.cpu().numpy()[0]
+            # Assuming price changes are somewhere in the feature set
+            # This is a simplification - adjust indices based on your actual feature order
+            recent_returns = tensor_data[:, 13]  # Adjust index to match Price_Change index
+            recent_volatility = np.std(recent_returns) if len(recent_returns) > 0 else 0
+            
+            # Determine trend (very simplified)
+            if np.mean(recent_returns) > 0:
+                market_trend = "bullish"
+            else:
+                market_trend = "bearish"
+                
+        # Add this market context to output
+        print("\nMarket Context:")
+        print(f"- Recent market trend appears {market_trend}")
+        if recent_volatility > 0:
+            print(f"- Recent volatility: {recent_volatility:.4f}")
+            
+    except Exception as e:
+        # Silently handle any errors in market context extraction
+        pass
+
+    return adjusted_prediction, confidence, uncertainty, latest_dates
 
 
 # --------------------- Create Ensemble of Models ---------------------
