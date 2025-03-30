@@ -1842,7 +1842,7 @@ def train_and_backtest_model(ticker='SPY', start_date='2022-03-30', end_date='20
     
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        optimizer, mode='max', factor=0.5, patience=5
     )
     
     # Early stopping
